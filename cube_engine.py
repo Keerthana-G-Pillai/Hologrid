@@ -56,20 +56,37 @@ class CubeEngine:
         # Active hand cursor position in grid coordinates
         self.cursor = (0, 0, 0)
 
-        # 3D View orientation: slight pitch and yaw for 3D isometric look
-        self.rot_x = 18.0
-        self.rot_y = -30.0
-        self.rot_z = 0.0
-        self.scale = 0.85
-        self.camera_dist = 5.8
+        # -------------------------------------------------------------
+        # PROPER 3D ORBIT CAMERA SYSTEM
+        # -------------------------------------------------------------
+        # Camera orbits around the stable central pivot of the hologrid
+        self.target = np.array([0.0, 0.0, 0.0], dtype=np.float64)
 
-        # Generate 3D horizontal ground grid lines (Y = -2.0 plane)
+        # Yaw (horizontal orbit 0..360°) and Pitch (vertical orbit)
+        self.yaw = -30.0    # degrees, full 360 continuous wrap
+        self.pitch = 22.0   # degrees, safe vertical orbit without camera inversion
+        self.roll = 0.0
+
+        # Camera distance: controlled by zoom
+        # Default distance chosen so the entire hologrid plane and blocks comfortably fit viewport on startup
+        self.DEFAULT_DIST = 9.5
+        self.MIN_DIST = 4.0   # Zoomed in close inspection
+        self.MAX_DIST = 22.0  # Zoomed out wide overview
+        self.distance = self.DEFAULT_DIST
+
+        # Vertical Field of View in degrees
+        self.fov_deg = 46.0
+
+        # Generate 3D centered ground grid lines at Y = 0.0 plane (dead center)
         self.ground_grid_edges = []
         self.ground_grid_vertices = []
-        self._build_ground_grid()
+        self._build_ground_grid(span=8, step=0.35, y_level=0.0)
 
-    def _build_ground_grid(self, span=12, step=0.35, y_level=-1.8):
-        """Generates static 3D line segments for the ground grid plane."""
+    def _build_ground_grid(self, span=8, step=0.35, y_level=0.0):
+        """
+        Generates 3D CAD ground grid centered exactly around (0, y_level, 0).
+        Comfortable span ensures the full working plane fits on screen at default distance.
+        """
         verts = []
         edges = []
         idx = 0
@@ -100,37 +117,14 @@ class CubeEngine:
             return True
         return False
 
-    def add_linear_step(self, target_gx: int, target_gy: int, target_gz: int):
-        """
-        Places the next block along the dominant straight-line axis from the
-        last placed position, producing clean linear beams and rectangular frames.
-        """
-        if not self.blocks or self.last_placed_pos is None:
-            return self.add_block(target_gx, target_gy, target_gz)
-
-        lx, ly, lz = self.last_placed_pos
-        dx = target_gx - lx
-        dy = target_gy - ly
-        dz = target_gz - lz
-
-        # If already at the last placed position, nothing to add
-        if dx == 0 and dy == 0 and dz == 0:
-            return False
-
-        # Find dominant axis to enforce straight line movement
-        abs_dx, abs_dy, abs_dz = abs(dx), abs(dy), abs(dz)
-        if abs_dx >= abs_dy and abs_dx >= abs_dz:
-            step_pos = (lx + (1 if dx > 0 else -1), ly, lz)
-        elif abs_dy >= abs_dx and abs_dy >= abs_dz:
-            step_pos = (lx, ly + (1 if dy > 0 else -1), lz)
-        else:
-            step_pos = (lx, ly, lz + (1 if dz > 0 else -1))
-
-        return self.add_block(step_pos[0], step_pos[1], step_pos[2])
-
     def remove_block(self, gx: int, gy: int, gz: int):
         pos = (int(gx), int(gy), int(gz))
-        self.blocks.discard(pos)
+        if pos in self.blocks:
+            self.blocks.discard(pos)
+            if pos in self.history:
+                self.history.remove(pos)
+            return True
+        return False
 
     def set_active_stroke(self, cells):
         """Sets the in-progress preview stroke cells."""
@@ -184,74 +178,119 @@ class CubeEngine:
         self.active_stroke.clear()
         self.last_placed_pos = None
 
-    def zoom_in(self):
-        self.scale = min(3.0, self.scale * 1.15)
+    def zoom_in(self, factor=0.88):
+        """Moves camera closer along orbit line (reveals more detail)."""
+        self.distance = max(self.MIN_DIST, self.distance * factor)
 
-    def zoom_out(self):
-        self.scale = max(0.25, self.scale * 0.85)
+    def zoom_out(self, factor=1.14):
+        """Moves camera farther along orbit line (reveals more of the plane)."""
+        self.distance = min(self.MAX_DIST, self.distance * factor)
+
+    def set_zoom_distance(self, dist):
+        """Directly set camera orbit distance clamped to safe limits."""
+        self.distance = max(self.MIN_DIST, min(self.MAX_DIST, float(dist)))
 
     def set_preset_view(self, preset="iso"):
         if preset == "iso":
-            self.rot_x, self.rot_y, self.rot_z = 18.0, -30.0, 0.0
+            self.pitch, self.yaw = 24.0, -30.0
         elif preset == "front":
-            self.rot_x, self.rot_y, self.rot_z = 0.0, 0.0, 0.0
+            self.pitch, self.yaw = 0.0, 0.0
         elif preset == "top":
-            self.rot_x, self.rot_y, self.rot_z = 88.0, 0.0, 0.0
+            self.pitch, self.yaw = 85.0, 0.0
+        self.distance = self.DEFAULT_DIST
 
-    def rotate_nudge(self, pitch_delta=0.0, yaw_delta=0.0):
-        self.rot_x += pitch_delta
-        self.rot_y += yaw_delta
+    def rotate_orbit(self, pitch_delta=0.0, yaw_delta=0.0):
+        """
+        Orbits the camera smoothly around the hologrid center.
+        Yaw rotates full 360° continuously.
+        Pitch is bounded between -75° and +85° to prevent camera flipping.
+        """
+        self.yaw = (self.yaw + yaw_delta) % 360.0
+        self.pitch = max(-75.0, min(85.0, self.pitch + pitch_delta))
+
+    def set_orbit(self, pitch_deg, yaw_deg):
+        self.yaw = yaw_deg % 360.0
+        self.pitch = max(-75.0, min(85.0, pitch_deg))
 
     def set_cursor(self, gx: int, gy: int, gz: int):
         self.cursor = (int(gx), int(gy), int(gz))
 
-    def set_transform(self, rot_x_deg, rot_y_deg, rot_z_deg):
-        self.rot_x = rot_x_deg
-        self.rot_y = rot_y_deg
-        self.rot_z = rot_z_deg
+    def get_view_matrix(self):
+        """
+        Computes standard 4x4 LookAt View Matrix for camera orbiting target:
+        eye = target + distance * [cos(pitch)*sin(yaw), sin(pitch), cos(pitch)*cos(yaw)]
+        """
+        p_rad = np.radians(self.pitch)
+        y_rad = np.radians(self.yaw)
 
-    @staticmethod
-    def _rot_matrix_x(deg):
-        a = np.radians(deg)
-        c, s = np.cos(a), np.sin(a)
-        return np.array([[1, 0, 0], [0, c, -s], [0, s, c]], dtype=np.float64)
+        # Eye position in 3D world space
+        eye_x = self.target[0] + self.distance * np.cos(p_rad) * np.sin(y_rad)
+        eye_y = self.target[1] + self.distance * np.sin(p_rad)
+        eye_z = self.target[2] + self.distance * np.cos(p_rad) * np.cos(y_rad)
+        eye = np.array([eye_x, eye_y, eye_z], dtype=np.float64)
 
-    @staticmethod
-    def _rot_matrix_y(deg):
-        a = np.radians(deg)
-        c, s = np.cos(a), np.sin(a)
-        return np.array([[c, 0, s], [0, 1, 0], [-s, 0, c]], dtype=np.float64)
+        # Forward vector (from eye to target)
+        forward = self.target - eye
+        norm_f = np.linalg.norm(forward)
+        forward = forward / norm_f if norm_f > 1e-6 else np.array([0, 0, -1], dtype=np.float64)
 
-    @staticmethod
-    def _rot_matrix_z(deg):
-        a = np.radians(deg)
-        c, s = np.cos(a), np.sin(a)
-        return np.array([[c, -s, 0], [s, c, 0], [0, 0, 1]], dtype=np.float64)
+        # Up vector (world +Y)
+        world_up = np.array([0.0, 1.0, 0.0], dtype=np.float64)
 
-    def get_rotation_matrix(self):
-        return (self._rot_matrix_z(self.rot_z) @
-                self._rot_matrix_y(self.rot_y) @
-                self._rot_matrix_x(self.rot_x))
+        # Right vector
+        right = np.cross(forward, world_up)
+        norm_r = np.linalg.norm(right)
+        if norm_r < 1e-6:
+            right = np.array([1.0, 0.0, 0.0], dtype=np.float64)
+        else:
+            right = right / norm_r
+
+        # Recompute orthonormal true up
+        true_up = np.cross(right, forward)
+
+        # Camera rotation matrix (World -> Camera space)
+        # Camera convention: X=right, Y=up, Z=-forward (looking down -Z)
+        R = np.vstack([right, true_up, -forward])
+        t = -R @ eye
+
+        return R, t, eye
+
+    def get_camera_r(self):
+        """Returns the 3x3 Camera Rotation Matrix (World -> Camera space)."""
+        R, _, _ = self.get_view_matrix()
+        return R
 
     def project_points(self, pts3d, screen_w, screen_h):
-        """Perspective project 3D points -> 2D screen coordinates."""
-        focal_length = screen_w * 0.95
+        """
+        Perspective project 3D world points -> 2D screen coordinates.
+        Maintains true aspect ratio and vertical FOV across any window resolution.
+        """
+        R, t, _ = self.get_view_matrix()
+        # Transform points to Camera Space: P_cam = pts3d @ R.T + t
+        cam_pts = pts3d @ R.T + t
+
+        # Focal length derived from vertical FOV
+        fov_rad = np.radians(self.fov_deg)
+        focal = (screen_h * 0.5) / np.tan(fov_rad * 0.5)
+
         pts2d = np.zeros((len(pts3d), 2), dtype=np.float64)
-        for i, (x, y, z) in enumerate(pts3d):
-            denom = self.camera_dist - z
-            denom = denom if abs(denom) > 1e-4 else 1e-4
-            factor = focal_length / denom
-            pts2d[i, 0] = x * factor + screen_w / 2.0
-            pts2d[i, 1] = -y * factor + screen_h / 2.0
-        return pts2d
+        cam_z = cam_pts[:, 2]
+
+        for i in range(len(pts3d)):
+            z = -cam_z[i] # distance in front of camera
+            z = z if z > 0.1 else 0.1
+            factor = focal / z
+            pts2d[i, 0] = cam_pts[i, 0] * factor + screen_w * 0.5
+            pts2d[i, 1] = -cam_pts[i, 1] * factor + screen_h * 0.5
+
+        return pts2d, cam_pts
 
     def get_screen_data(self, screen_w, screen_h):
-        """Calculates projected coordinates for ground grid, placed blocks, and cursor."""
-        rot_mat = self.get_rotation_matrix()
+        """Calculates projected coordinates for ground grid, placed blocks, active preview, and cursor."""
+        R, t, eye = self.get_view_matrix()
 
-        # 1. 3D Ground Grid (horizontal CAD floor)
-        world_grid = (self.ground_grid_vertices @ rot_mat.T) * self.scale
-        grid_pts2d = self.project_points(world_grid, screen_w, screen_h)
+        # 1. 3D Ground Grid (horizontal CAD floor centered around target)
+        grid_pts2d, _ = self.project_points(self.ground_grid_vertices, screen_w, screen_h)
 
         # 2. Placed blocks (sorted by camera depth for Painter's algorithm)
         block_items = []
@@ -260,69 +299,66 @@ class CubeEngine:
                                gy * self.grid_step,
                                gz * self.grid_step], dtype=np.float64)
             local_v = self.unit_vertices + offset
-            world_v = (local_v @ rot_mat.T) * self.scale
-            pts2d = self.project_points(world_v, screen_w, screen_h)
-            
-            # Average depth in camera space (Z component of world_v)
-            # Since camera looks from +Z, objects with smaller camera_dist - Z are closer
-            avg_z = float(np.mean(world_v[:, 2]))
-            
-            # Extract projected faces with outward world normals
+            pts2d, cam_v = self.project_points(local_v, screen_w, screen_h)
+
+            # Distance from camera eye to block center for back-to-front sorting
+            center_world = offset
+            dist_to_eye = float(np.linalg.norm(center_world - eye))
+
+            # Faces in camera space
             faces = []
             for face_idx, normal in self.cube_faces:
-                world_n = (normal @ rot_mat.T)
+                cam_n = normal @ R.T
                 face_pts = [pts2d[idx] for idx in face_idx]
-                face_avg_z = float(np.mean([world_v[idx, 2] for idx in face_idx]))
+                face_avg_dist = float(np.mean([np.linalg.norm(local_v[idx] - eye) for idx in face_idx]))
                 faces.append({
                     "pts": face_pts,
-                    "normal": world_n,
-                    "avg_z": face_avg_z,
+                    "normal": cam_n,
+                    "avg_z": -face_avg_dist, # for sorted_faces ascending (furthest first)
                 })
-            
+
             block_items.append({
                 "pts2d": pts2d,
                 "edges": self.cube_edges,
                 "faces": faces,
-                "avg_z": avg_z,
+                "avg_z": -dist_to_eye, # furthest first
                 "grid_pos": (gx, gy, gz),
             })
 
-        # 3. Active cursor block (white/grey wireframe)
+        # 3. Active cursor block
         cgx, cgy, cgz = self.cursor
         cursor_offset = np.array([cgx * self.grid_step,
                                   cgy * self.grid_step,
                                   cgz * self.grid_step], dtype=np.float64)
         cursor_v = (self.unit_vertices * 1.05) + cursor_offset
-        cursor_world = (cursor_v @ rot_mat.T) * self.scale
-        cursor_pts2d = self.project_points(cursor_world, screen_w, screen_h)
+        cursor_pts2d, _ = self.project_points(cursor_v, screen_w, screen_h)
 
-        # 4. In-progress stroke preview (glowing blue preview blocks)
+        # 4. In-progress stroke preview
         stroke_items = []
         for (sgx, sgy, sgz) in self.active_stroke:
             offset = np.array([sgx * self.grid_step,
                                sgy * self.grid_step,
                                sgz * self.grid_step], dtype=np.float64)
             local_v = self.unit_vertices + offset
-            world_v = (local_v @ rot_mat.T) * self.scale
-            pts2d = self.project_points(world_v, screen_w, screen_h)
-            avg_z = float(np.mean(world_v[:, 2]))
-            
+            pts2d, cam_v = self.project_points(local_v, screen_w, screen_h)
+            dist_to_eye = float(np.linalg.norm(offset - eye))
+
             faces = []
             for face_idx, normal in self.cube_faces:
-                world_n = (normal @ rot_mat.T)
+                cam_n = normal @ R.T
                 face_pts = [pts2d[idx] for idx in face_idx]
-                face_avg_z = float(np.mean([world_v[idx, 2] for idx in face_idx]))
+                face_avg_dist = float(np.mean([np.linalg.norm(local_v[idx] - eye) for idx in face_idx]))
                 faces.append({
                     "pts": face_pts,
-                    "normal": world_n,
-                    "avg_z": face_avg_z,
+                    "normal": cam_n,
+                    "avg_z": -face_avg_dist,
                 })
-            
+
             stroke_items.append({
                 "pts2d": pts2d,
                 "edges": self.cube_edges,
                 "faces": faces,
-                "avg_z": avg_z,
+                "avg_z": -dist_to_eye,
                 "grid_pos": (sgx, sgy, sgz),
             })
 
@@ -335,6 +371,9 @@ class CubeEngine:
             "stroke_count": len(self.stroke_history),
             "active_stroke_len": len(self.active_stroke),
             "cursor_pos": (cgx, cgy, cgz),
+            "camera_dist": self.distance,
+            "yaw": self.yaw,
+            "pitch": self.pitch,
         }
 
 

@@ -28,20 +28,24 @@ class HologramRenderer:
         self.grid_color = (70, 48, 16)            # subtle dark cyan/blue grid lines
         self.grid_highlight = (140, 95, 30)       # glowing blue grid accents
 
-        # OPAQUE SHINING ELECTRIC BLUE BLOCKS
-        # Face base colors for directional 3D shading (high contrast, opaque, shining)
-        self.face_base_blue = np.array([210, 110, 15], dtype=np.float64)  # electric blue body
+        # OPAQUE SHINING ELECTRIC BLUE BLOCKS (SOLID ENERGY UNITS)
+        # Deep opaque electric blue core faces with high contrast directional shading
+        self.face_base_blue = np.array([235, 115, 15], dtype=np.float64)  # Solid electric blue
         self.light_dir = np.array([0.35, 0.75, 0.55], dtype=np.float64)   # directional light vector
         self.light_dir /= np.linalg.norm(self.light_dir)
 
-        # Luminous cyan-blue edges and outer glow
-        self.edge_cyan_core = (255, 235, 30)      # bright electric cyan edges
+        # Luminous cyan-blue edges and outer border
+        self.edge_cyan_core = (255, 245, 45)      # bright electric cyan edges
         self.edge_cyan_glow = (220, 130, 0)       # outer cyan bloom
         
-        # In-progress stroke preview colors (distinct glowing cyan-trail)
-        self.preview_face_blue = np.array([160, 80, 10], dtype=np.float64)
-        self.preview_edge_core = (255, 240, 80)
-        self.preview_edge_glow = (180, 120, 0)
+        # In-progress stroke preview colors (distinct bright cyan-preview trail)
+        self.preview_face_blue = np.array([190, 85, 10], dtype=np.float64)
+        self.preview_edge_core = (255, 250, 100)
+        self.preview_edge_glow = (200, 140, 0)
+
+        # Erase target highlight color (intense red/orange contrasting wireframe & fill)
+        self.erase_face_col = (30, 30, 180)
+        self.erase_edge_col = (40, 60, 255)
 
         # Cursor
         self.cursor_edge = (240, 240, 240)
@@ -61,11 +65,12 @@ class HologramRenderer:
                 continue
             cv2.line(canvas, pt1, pt2, self.grid_color, 1, cv2.LINE_AA)
 
-    def _draw_opaque_blocks(self, canvas, block_items, is_preview=False):
+    def _draw_opaque_blocks(self, canvas, block_items, is_preview=False, erase_target_cell=None):
         """
         Renders OPAQUE, SHINING ELECTRIC BLUE 3D BLOCKS with bright luminous cyan edges.
-        Uses Painter's algorithm (back-to-front depth sorting) and directional shading.
-        Adjacent blocks maintain bevel separation (92% block size) so individual units pop.
+        100% OPAQUE - NO ALPHA BLENDING OR TRANSPARENT GLASS LOOK.
+        Uses Painter's algorithm (back-to-front depth sorting) and directional lighting.
+        Bevel separation (92% block size) ensures distinct physical units.
         """
         if not block_items:
             return
@@ -77,15 +82,17 @@ class HologramRenderer:
             pts2d = block["pts2d"]
             faces = block.get("faces", [])
             edges = block.get("edges", [])
+            pos = block.get("grid_pos")
 
-            # 1. Render opaque shaded faces sorted by face depth
+            is_erase_target = (erase_target_cell is not None and pos == erase_target_cell)
+
+            # 1. Render 100% OPAQUE shaded faces sorted by face depth
             sorted_faces = sorted(faces, key=lambda f: f.get("avg_z", 0.0))
             for f in sorted_faces:
                 f_pts = f["pts"]
                 f_norm = f["normal"]
 
-                # Back-face culling check (camera looks down -Z in view space)
-                # In our coordinate convention, faces pointing towards camera have norm_z > -0.15
+                # Back-face culling check
                 if f_norm[2] < -0.20:
                     continue
 
@@ -93,46 +100,73 @@ class HologramRenderer:
                 if len(poly) < 3:
                     continue
 
-                # Directional lighting calculation: diffuse + specular highlight
-                diffuse = max(0.20, float(np.dot(f_norm, self.light_dir)))
-                specular = 0.0
-                # Approximate specular reflection towards camera [0, 0, 1]
-                half_vec = self.light_dir + np.array([0, 0, 1], dtype=np.float64)
-                half_vec /= np.linalg.norm(half_vec)
-                n_dot_h = max(0.0, float(np.dot(f_norm, half_vec)))
-                if n_dot_h > 0.70:
-                    specular = (n_dot_h ** 8) * 80.0
+                if is_erase_target:
+                    fill_color = self.erase_face_col
+                else:
+                    # Directional lighting calculation: diffuse + specular highlight
+                    diffuse = max(0.25, float(np.dot(f_norm, self.light_dir)))
+                    specular = 0.0
+                    half_vec = self.light_dir + np.array([0, 0, 1], dtype=np.float64)
+                    half_vec /= np.linalg.norm(half_vec)
+                    n_dot_h = max(0.0, float(np.dot(f_norm, half_vec)))
+                    if n_dot_h > 0.65:
+                        specular = (n_dot_h ** 10) * 110.0
 
-                base = self.preview_face_blue if is_preview else self.face_base_blue
-                # Calculate opaque shaded BGR
-                b = min(255, int(base[0] * diffuse + specular + 35))
-                g = min(255, int(base[1] * diffuse + specular * 0.6 + 18))
-                r = min(255, int(base[2] * diffuse + specular * 0.3 + 8))
-                fill_color = (b, g, r)
+                    base = self.preview_face_blue if is_preview else self.face_base_blue
+                    b = min(255, int(base[0] * diffuse + specular + 40))
+                    g = min(255, int(base[1] * diffuse + specular * 0.6 + 20))
+                    r = min(255, int(base[2] * diffuse + specular * 0.3 + 10))
+                    fill_color = (b, g, r)
 
-                # Fill opaque polygon
+                # DIRECT SOLID FILL (100% Opaque, alpha = 1.0)
                 cv2.fillConvexPoly(canvas, poly, fill_color, lineType=cv2.LINE_AA)
 
-            # 2. Render luminous cyan outer edge glow and bright core wireframe
-            core_col = self.preview_edge_core if is_preview else self.edge_cyan_core
+            # 2. Render luminous cyan outer edge borders with subtle glow
+            if is_erase_target:
+                core_col = self.erase_edge_col
+                border_thick = 3
+            else:
+                core_col = self.preview_edge_core if is_preview else self.edge_cyan_core
+                border_thick = 1 if is_preview else 2
+
+                # Subtle emissive outer glow pass around solid block
+                if not is_preview:
+                    for (i, j) in edges:
+                        p1, p2 = pts2d[i], pts2d[j]
+                        if not (np.all(np.isfinite(p1)) and np.all(np.isfinite(p2))):
+                            continue
+                        pt1 = (int(p1[0]), int(p1[1]))
+                        pt2 = (int(p2[0]), int(p2[1]))
+                        cv2.line(canvas, pt1, pt2, (180, 110, 15), 4, cv2.LINE_AA)
+
+            # Sharp physical solid core edge
             for (i, j) in edges:
                 p1, p2 = pts2d[i], pts2d[j]
                 if not (np.all(np.isfinite(p1)) and np.all(np.isfinite(p2))):
                     continue
                 pt1 = (int(p1[0]), int(p1[1]))
                 pt2 = (int(p2[0]), int(p2[1]))
-                cv2.line(canvas, pt1, pt2, core_col, 1 if is_preview else 2, cv2.LINE_AA)
+                cv2.line(canvas, pt1, pt2, core_col, border_thick, cv2.LINE_AA)
 
-    def _draw_cursor(self, canvas, pts2d, edges, is_painting=False):
+    def _draw_cursor(self, canvas, pts2d, edges, state="IDLE"):
         """Renders 3D cursor block at index brush position."""
-        edge_col = (0, 255, 180) if is_painting else self.cursor_edge
+        if state == "PAINT":
+            edge_col = (0, 255, 180)
+            thickness = 2
+        elif state == "ERASE":
+            edge_col = (50, 80, 255)
+            thickness = 2
+        else:
+            edge_col = self.cursor_edge
+            thickness = 1
+
         for (i, j) in edges:
             p1, p2 = pts2d[i], pts2d[j]
             if not (np.all(np.isfinite(p1)) and np.all(np.isfinite(p2))):
                 continue
             pt1 = (int(p1[0]), int(p1[1]))
             pt2 = (int(p2[0]), int(p2[1]))
-            cv2.line(canvas, pt1, pt2, edge_col, 2 if is_painting else 1, cv2.LINE_AA)
+            cv2.line(canvas, pt1, pt2, edge_col, thickness, cv2.LINE_AA)
 
     def _draw_clear_button(self, canvas, btn_rect, is_hovered=False):
         """Minimal clean [CLEAR] button in top-left."""
@@ -156,18 +190,21 @@ class HologramRenderer:
     def _draw_gesture_control_panel(self, canvas, gesture_info):
         """
         Permanent on-screen HELP / CONTROL PANEL in bottom-left.
-        Clearly displays all movement controls matching the required specification:
-        - 🤏 PINCH + INDEX -> PAINT / DRAW
-        - 🖐 OPEN PALM -> MOVE -> ROTATE
-        - 👐 TWO HANDS -> APART: ZOOM IN / TOGETHER: ZOOM OUT
-        - ✊ FIST -> STOP / CANCEL
+        Clearly displays all 5 precise mutually exclusive actions:
+        - 🤏 INDEX + THUMB  -> PAINT / DRAW
+        - 🖐 ONE OPEN PALM  -> ROTATE HORIZONTALLY / VERTICALLY
+        - 👐 TWO OPEN PALMS -> ZOOM IN
+        - ✊ TWO FISTS      -> ZOOM OUT
+        - ☝🖕 INDEX + MIDDLE -> ERASE
         """
-        px, py, pw, ph = 20, 72, 236, 385
+        pw, ph = 246, 395
+        px = 20
+        py = max(70, self.height - ph - 44)
 
         # Glassmorphic dark blue-tint backdrop
         hud_bg = canvas.copy()
         cv2.rectangle(hud_bg, (px, py), (px + pw, py + ph), (18, 14, 8), -1)
-        cv2.addWeighted(hud_bg, 0.78, canvas, 0.22, 0, dst=canvas)
+        cv2.addWeighted(hud_bg, 0.80, canvas, 0.20, 0, dst=canvas)
 
         # Futuristic glowing cyan border
         cv2.rectangle(canvas, (px, py), (px + pw, py + ph), (90, 70, 24), 1, cv2.LINE_AA)
@@ -189,45 +226,48 @@ class HologramRenderer:
                     cv2.FONT_HERSHEY_SIMPLEX, 0.44, (255, 230, 40), 1, cv2.LINE_AA)
         cv2.line(canvas, (px + 10, py + 28), (px + pw - 10, py + 28), (70, 52, 20), 1)
 
-        is_painting = gesture_info.get("is_painting", False) if gesture_info else False
-        is_rotating = gesture_info.get("is_rotating", False) if gesture_info else False
-        is_zooming = gesture_info.get("is_zooming", False) if gesture_info else False
-        mode_badge = gesture_info.get("mode_badge", "") if gesture_info else ""
-        is_fist = "STOPPED" in mode_badge or "FIST" in mode_badge
+        cur_state = gesture_info.get("state", "IDLE") if gesture_info else "IDLE"
 
         cards = [
             {
-                "icon": "PINCH + INDEX",
+                "icon": "🤏 INDEX + THUMB",
                 "act": "PAINT / DRAW",
-                "sub": "Continuous 3D Block Path",
-                "active": is_painting,
+                "sub": "PINCH -> DRAW -> RELEASE",
+                "active": (cur_state == "PAINT"),
                 "color": (0, 255, 180),
             },
             {
-                "icon": "OPEN PALM",
-                "act": "MOVE -> ROTATE",
-                "sub": "L/R: Yaw  |  U/D: Pitch",
-                "active": is_rotating,
+                "icon": "🖐 ONE OPEN PALM",
+                "act": "ROTATE 360 ORBIT",
+                "sub": "<- LEFT / RIGHT -> | ^ UP / DOWN v",
+                "active": (cur_state == "ROTATE"),
                 "color": (255, 220, 30),
             },
             {
-                "icon": "TWO HANDS",
-                "act": "ZOOM MODE",
-                "sub": "Apart: IN | Together: OUT",
-                "active": is_zooming,
-                "color": (255, 130, 240),
+                "icon": "👐 TWO OPEN PALMS",
+                "act": "ZOOM IN (CLOSER)",
+                "sub": "TOWARD CAMERA -> ZOOM IN",
+                "active": (cur_state == "ZOOM_IN"),
+                "color": (255, 140, 240),
             },
             {
-                "icon": "CLOSED FIST",
-                "act": "STOP / CANCEL",
-                "sub": "Cancels Active Action",
-                "active": is_fist,
-                "color": (60, 130, 255),
+                "icon": "✊ TWO CLOSED FISTS",
+                "act": "ZOOM OUT (FARTHER)",
+                "sub": "TWO FISTS -> ZOOM OUT",
+                "active": (cur_state == "ZOOM_OUT"),
+                "color": (240, 110, 180),
+            },
+            {
+                "icon": "☝🖕 INDEX + MIDDLE",
+                "act": "ERASE BLOCK",
+                "sub": "INDEX + MIDDLE -> ERASE",
+                "active": (cur_state == "ERASE"),
+                "color": (50, 90, 255),
             },
         ]
 
-        item_y = py + 38
-        item_h = 58
+        item_y = py + 34
+        item_h = 49
         for card in cards:
             box_x = px + 10
             box_w = pw - 20
@@ -237,83 +277,99 @@ class HologramRenderer:
                 cv2.rectangle(cbg, (box_x, item_y), (box_x + box_w, item_y + item_h), (40, 32, 16), -1)
                 cv2.addWeighted(cbg, 0.70, canvas, 0.30, 0, dst=canvas)
                 cv2.rectangle(canvas, (box_x, item_y), (box_x + box_w, item_y + item_h), card["color"], 1, cv2.LINE_AA)
-                cv2.circle(canvas, (box_x + 8, item_y + 14), 4, card["color"], -1, cv2.LINE_AA)
+                cv2.circle(canvas, (box_x + 8, item_y + 13), 4, card["color"], -1, cv2.LINE_AA)
                 title_col = (255, 255, 255)
             else:
                 cv2.rectangle(canvas, (box_x, item_y), (box_x + box_w, item_y + item_h), (45, 36, 18), 1)
-                cv2.circle(canvas, (box_x + 8, item_y + 14), 3, (80, 70, 45), -1)
+                cv2.circle(canvas, (box_x + 8, item_y + 13), 3, (80, 70, 45), -1)
                 title_col = (190, 200, 200)
 
-            cv2.putText(canvas, card["icon"], (box_x + 18, item_y + 17),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.38, title_col, 1, cv2.LINE_AA)
-            cv2.putText(canvas, card["act"], (box_x + 18, item_y + 34),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.36, card["color"] if card["active"] else (220, 180, 40), 1, cv2.LINE_AA)
-            cv2.putText(canvas, card["sub"], (box_x + 18, item_y + 49),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.30, (140, 160, 160), 1, cv2.LINE_AA)
+            cv2.putText(canvas, card["icon"], (box_x + 18, item_y + 14),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.36, title_col, 1, cv2.LINE_AA)
+            cv2.putText(canvas, card["act"], (box_x + 18, item_y + 29),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.35, card["color"] if card["active"] else (220, 180, 40), 1, cv2.LINE_AA)
+            cv2.putText(canvas, card["sub"], (box_x + 18, item_y + 42),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.28, (140, 160, 160), 1, cv2.LINE_AA)
 
-            item_y += item_h + 8
+            item_y += item_h + 5
 
         # Footer notes
-        item_y += 4
+        item_y += 2
         cv2.line(canvas, (px + 10, item_y), (px + pw - 10, item_y), (70, 52, 20), 1)
-        item_y += 18
-        cv2.putText(canvas, "RELEASE PINCH -> COMMIT", (px + 14, item_y),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.32, (200, 220, 220), 1, cv2.LINE_AA)
-        item_y += 15
-        cv2.putText(canvas, "FIST / IDLE -> SAFE STOP", (px + 14, item_y),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.32, (150, 170, 170), 1, cv2.LINE_AA)
+        item_y += 14
+        cv2.putText(canvas, "RELEASE -> STOP CURRENT ACTION", (px + 14, item_y),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.30, (200, 220, 220), 1, cv2.LINE_AA)
+        item_y += 13
+        cv2.putText(canvas, "MUTUALLY EXCLUSIVE ACTIONS", (px + 14, item_y),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.29, (140, 170, 170), 1, cv2.LINE_AA)
 
     def _draw_top_banners(self, canvas, gesture_info, screen_data):
         """
         Draws TOP-LEFT App Title and TOP-RIGHT Prominent Active Mode & Gesture Indicators.
-        Visually emphasizes the active state (e.g. MODE: PAINTING [STROKE ACTIVE], ZOOM IN ↑, ROTATE ↻).
+        Includes live directional cues: ROTATE RIGHT →, ← ROTATE LEFT, ↑ ROTATE UP, ZOOM IN ↑ CLOSER, etc.
         """
         # TOP LEFT: App Title & Subtitle
-        cv2.putText(canvas, "HOLOGRID BUILDER", (135, 38),
+        cv2.putText(canvas, "HOLOGRID BUILDER", (135, 36),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.65, (255, 235, 30), 2, cv2.LINE_AA)
-        cv2.putText(canvas, "3D HOLOGRAPHIC SCULPTOR", (135, 54),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.34, (180, 150, 60), 1, cv2.LINE_AA)
+        cv2.putText(canvas, "3D HOLOGRAPHIC SCULPTOR • PRECISION FSM", (135, 52),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.33, (180, 150, 60), 1, cv2.LINE_AA)
 
         # TOP RIGHT: Active Mode & Action Badge
-        mode_badge = gesture_info.get("mode_badge", "MODE: READY") if gesture_info else "MODE: READY"
+        mode_badge = gesture_info.get("mode_badge", "READY") if gesture_info else "READY"
         action_badge = gesture_info.get("action_badge", "") if gesture_info else ""
+        direction_badge = gesture_info.get("direction_badge", "") if gesture_info else ""
+        cur_state = gesture_info.get("state", "IDLE") if gesture_info else "IDLE"
 
         # Color coding for mode
-        if "PAINTING" in mode_badge:
-            badge_border = (0, 255, 180)     # luminous electric cyan/green
+        if cur_state == "PAINT":
+            badge_border = (0, 255, 180)     # electric cyan/green
             badge_fill = (35, 50, 25)
-        elif "ROTATING" in mode_badge:
+        elif cur_state == "ROTATE":
             badge_border = (255, 220, 30)    # electric cyan-blue
             badge_fill = (45, 38, 18)
-        elif "ZOOM" in mode_badge:
-            badge_border = (255, 130, 240)   # magenta/violet
+        elif cur_state == "ZOOM_IN":
+            badge_border = (255, 140, 240)   # magenta/violet
             badge_fill = (45, 22, 42)
-        elif "STOPPED" in mode_badge:
-            badge_border = (60, 130, 255)    # amber/orange
-            badge_fill = (20, 25, 45)
+        elif cur_state == "ZOOM_OUT":
+            badge_border = (240, 110, 180)   # deep rose
+            badge_fill = (45, 18, 32)
+        elif cur_state == "ERASE":
+            badge_border = (50, 90, 255)     # electric red/amber
+            badge_fill = (45, 20, 20)
         else:
             badge_border = (160, 140, 50)    # calm blue-grey
             badge_fill = (22, 18, 12)
 
-        # Render prominent badge in top right
-        bx, by, bw, bh = self.width - 290, 16, 270, 48
+        # Render prominent badge in top right (expanded for direction feedback)
+        bx, by, bw, bh = self.width - 320, 14, 300, 56
         bg_card = canvas.copy()
         cv2.rectangle(bg_card, (bx, by), (bx + bw, by + bh), badge_fill, -1)
-        cv2.addWeighted(bg_card, 0.70, canvas, 0.30, 0, dst=canvas)
+        cv2.addWeighted(bg_card, 0.72, canvas, 0.28, 0, dst=canvas)
         cv2.rectangle(canvas, (bx, by), (bx + bw, by + bh), badge_border, 1, cv2.LINE_AA)
 
         # Text inside badge
-        cv2.putText(canvas, mode_badge, (bx + 14, by + 22),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.52, (255, 255, 255), 1, cv2.LINE_AA)
-        if action_badge:
-            cv2.putText(canvas, action_badge, (bx + 14, by + 40),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.42, badge_border, 1, cv2.LINE_AA)
+        header_text = f"STATE: {mode_badge}"
+        cv2.putText(canvas, header_text, (bx + 14, by + 20),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.50, (255, 255, 255), 1, cv2.LINE_AA)
+        
+        detail_text = f"{action_badge}"
+        if direction_badge:
+            detail_text += f" | {direction_badge}"
+        if len(detail_text) > 34:
+            detail_text = detail_text[:34]
+
+        cv2.putText(canvas, detail_text, (bx + 14, by + 42),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.38, badge_border, 1, cv2.LINE_AA)
 
     def render(self, screen_data, gesture_info=None, clear_btn_rect=(20, 20, 95, 34),
-               is_btn_hovered=False):
+               is_btn_hovered=False, canvas_w=None, canvas_h=None):
+        if canvas_w is not None and canvas_h is not None:
+            self.width = canvas_w
+            self.height = canvas_h
+
         canvas = np.full((self.height, self.width, 3), self.bg_color, dtype=np.uint8)
 
-        # 1. 3D Perspective Ground Grid
+        # 1. 3D Perspective Ground Grid (centered in viewport)
         if "ground_grid" in screen_data:
             g_pts2d, g_edges = screen_data["ground_grid"]
             self._draw_ground_grid(canvas, g_pts2d, g_edges)
@@ -323,18 +379,20 @@ class HologramRenderer:
         if stroke_preview:
             self._draw_opaque_blocks(canvas, stroke_preview, is_preview=True)
 
-        # 3. Committed Blocks (Opaque, shining electric blue blocks with cyan luminous edges)
+        # 3. Committed Blocks (100% Opaque, shining electric blue blocks with cyan luminous edges)
         placed_blocks = screen_data.get("blocks", [])
+        cur_state = gesture_info.get("state", "IDLE") if gesture_info else "IDLE"
+        erase_target_cell = gesture_info.get("grid_pos") if cur_state == "ERASE" else None
+        
         if placed_blocks:
-            self._draw_opaque_blocks(canvas, placed_blocks, is_preview=False)
+            self._draw_opaque_blocks(canvas, placed_blocks, is_preview=False, erase_target_cell=erase_target_cell)
 
         # 4. Active Brush Cursor at index fingertip
         preview_active = gesture_info.get("preview_active", False) if gesture_info else False
-        is_painting = gesture_info.get("is_painting", False) if gesture_info else False
 
         if "cursor" in screen_data and preview_active:
             cur_pts2d, cur_edges = screen_data["cursor"]
-            self._draw_cursor(canvas, cur_pts2d, cur_edges, is_painting=is_painting)
+            self._draw_cursor(canvas, cur_pts2d, cur_edges, state=cur_state)
 
         # 5. Clean minimal [CLEAR] button in top-left
         self._draw_clear_button(canvas, clear_btn_rect, is_btn_hovered)
@@ -345,11 +403,14 @@ class HologramRenderer:
         # 7. Permanent Futuristic Gesture Help / Control Panel (Corner HUD)
         self._draw_gesture_control_panel(canvas, gesture_info)
 
-        # 8. Clean bottom status strip (blocks, strokes, in-progress count, coordinates)
+        # 8. Clean bottom status strip (blocks, strokes, in-progress count, coordinates, camera orbit)
         count = screen_data.get("count", 0)
         strokes = screen_data.get("stroke_count", 0)
         drawing_len = screen_data.get("active_stroke_len", 0)
         cpos = screen_data.get("cursor_pos", (0, 0, 0))
+        cam_dist = screen_data.get("camera_dist", 9.8)
+        yaw = screen_data.get("yaw", 0.0)
+        pitch = screen_data.get("pitch", 0.0)
 
         bottom_bar = canvas.copy()
         cv2.rectangle(bottom_bar, (0, self.height - 34), (self.width, self.height), (8, 6, 4), -1)
@@ -359,20 +420,10 @@ class HologramRenderer:
         cv2.putText(canvas, status_left, (20, self.height - 11),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.44, (200, 220, 220), 1, cv2.LINE_AA)
 
-        # Coordinates display on right
-        if gesture_info and gesture_info.get("hand_visible", False):
-            ip = gesture_info.get("index_pos")
-            pp = gesture_info.get("palm_pos")
-            if preview_active and ip:
-                debug_txt = f"INDEX BRUSH: ({ip[0]}, {ip[1]})"
-            elif gesture_info.get("is_rotating") and pp:
-                debug_txt = f"PALM CTR: ({pp[0]}, {pp[1]})"
-            elif ip:
-                debug_txt = f"INDEX: ({ip[0]}, {ip[1]})"
-            else:
-                debug_txt = "STANDBY"
-            cv2.putText(canvas, debug_txt, (self.width - 480, self.height - 11),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.42, (160, 200, 200), 1, cv2.LINE_AA)
+        # Orbit & Camera info on right
+        orbit_info = f"ORBIT YAW: {yaw:.0f}°  PITCH: {pitch:.0f}°  ZOOM DIST: {cam_dist:.1f}"
+        cv2.putText(canvas, orbit_info, (max(20, self.width - 440), self.height - 11),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.40, (140, 200, 220), 1, cv2.LINE_AA)
 
         return canvas
 

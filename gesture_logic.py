@@ -64,6 +64,192 @@ def interpolate_3d_line(p0, p1):
     return cells
 
 
+class GeometricStrokeBuilder:
+    """
+    Segment-Based Sticky-Axis 3D Geometric Drawing Engine.
+    
+    Principles:
+    1. INTENT WINDOW:
+       - Collects initial fingertip samples at start of stroke/segment.
+       - Locks dominant direction: 'H' (Horizontal, lock Y), 'V' (Vertical, lock X), or 'CURVE'.
+    2. STICKY AXIS LOCK:
+       - In 'H': Y is STRICTLY locked to the initial row. MediaPipe vertical jitter is 100% ignored.
+       - In 'V': X is STRICTLY locked to the initial column. MediaPipe horizontal jitter is 100% ignored.
+       - Depth Z is locked to the stroke plane.
+    3. SEGMENT-BASED CORNER DETECTION:
+       - Sustained perpendicular motion (> DIRECTION_CHANGE_THRESHOLD for CORNER_SUSTAIN_FRAMES)
+         ends the previous segment cleanly at the corner block and starts the next perpendicular segment.
+       - Creates razor-sharp 90° right angles (no rounded corners, no diagonal transitions).
+    4. PERFECT VOXEL RECTANGLES / SQUARES:
+       - A 4-sided loop snaps closed when returning within 1 cell of the start point.
+       - Exactly one block thick with zero gaps, zero clustering, and zero zigzags.
+    """
+    def __init__(self):
+        self.DIRECTION_CHANGE_THRESHOLD = 0.85  # grid units required to turn a corner
+        self.CORNER_SUSTAIN_FRAMES = 2         # consecutive frames of perpendicular movement required
+        self.INTENT_MIN_DIST = 0.35            # movement required to decide initial segment direction
+        self.reset()
+
+    def reset(self):
+        self.all_completed_segments = []       # list of (seg_start_cell, seg_end_cell)
+        self.start_cell = None
+        self.anchor_cell = None
+        self.anchor_float = None
+        self.locked_axis = None                # 'H', 'V', 'CURVE', or None
+        self.locked_coord = None               # locked Y for 'H', locked X for 'V'
+        self.depth_z = 0
+        self.max_reach = 0
+        self.corner_sustain_count = 0
+        self.active_cell = None
+        self.stroke_cells = []
+        self.stroke_set = set()
+        self.last_cell = None
+
+    def start(self, float_pos):
+        fx, fy, fz = float(float_pos[0]), float(float_pos[1]), float(float_pos[2])
+        gx, gy, gz = int(round(fx)), int(round(fy)), int(round(fz))
+        start_cell = (gx, gy, gz)
+        self.all_completed_segments = []
+        self.start_cell = start_cell
+        self.anchor_cell = start_cell
+        self.anchor_float = (fx, fy, fz)
+        self.locked_axis = None
+        self.locked_coord = None
+        self.depth_z = gz
+        self.max_reach = gx
+        self.corner_sustain_count = 0
+        self.active_cell = start_cell
+        self.last_cell = start_cell
+        self.stroke_cells = [start_cell]
+        self.stroke_set = {start_cell}
+
+    def add_point(self, float_pos):
+        if self.anchor_cell is None:
+            self.start(float_pos)
+            return self.active_cell
+
+        fx, fy, fz = float(float_pos[0]), float(float_pos[1]), float(float_pos[2])
+        ax, ay, az = self.anchor_float
+
+        dx = fx - ax
+        dy = fy - ay
+        dist = math.hypot(dx, dy)
+
+        # 1. Intent Window: determine initial axis if not yet set
+        if self.locked_axis is None:
+            if dist < self.INTENT_MIN_DIST:
+                return self.anchor_cell
+            if abs(dx) >= 1.30 * abs(dy):
+                self.locked_axis = 'H'
+                self.locked_coord = self.anchor_cell[1] # lock Y row
+                self.max_reach = self.anchor_cell[0]
+            elif abs(dy) >= 1.30 * abs(dx):
+                self.locked_axis = 'V'
+                self.locked_coord = self.anchor_cell[0] # lock X col
+                self.max_reach = self.anchor_cell[1]
+            else:
+                self.locked_axis = 'CURVE'
+
+        # 2. Process according to active locked axis
+        if self.locked_axis == 'H':
+            locked_y = self.locked_coord
+            cur_gx = int(round(fx))
+            delta_y = fy - locked_y
+
+            # Check for deliberate corner turn (sustained vertical intent)
+            if abs(delta_y) >= self.DIRECTION_CHANGE_THRESHOLD:
+                self.corner_sustain_count += 1
+                if self.corner_sustain_count >= self.CORNER_SUSTAIN_FRAMES:
+                    # Finalize current horizontal segment at corner!
+                    corner_x = self.max_reach
+                    corner_cell = (corner_x, locked_y, self.depth_z)
+                    self.all_completed_segments.append((self.anchor_cell, corner_cell))
+
+                    # Start new vertical segment at corner_cell
+                    self.anchor_cell = corner_cell
+                    self.anchor_float = (float(corner_x), float(locked_y), float(self.depth_z))
+                    self.locked_axis = 'V'
+                    self.locked_coord = corner_x # lock X to corner_x
+                    self.max_reach = corner_cell[1]
+                    self.corner_sustain_count = 0
+                    return self.add_point(float_pos)
+            else:
+                self.corner_sustain_count = 0
+                reach_dir = 1 if (cur_gx >= self.anchor_cell[0]) else -1
+                if reach_dir == 1 and cur_gx > self.max_reach:
+                    self.max_reach = cur_gx
+                elif reach_dir == -1 and cur_gx < self.max_reach:
+                    self.max_reach = cur_gx
+
+            active_cell = (cur_gx, locked_y, self.depth_z)
+
+        elif self.locked_axis == 'V':
+            locked_x = self.locked_coord
+            cur_gy = int(round(fy))
+            delta_x = fx - locked_x
+
+            # Check for deliberate corner turn (sustained horizontal intent)
+            if abs(delta_x) >= self.DIRECTION_CHANGE_THRESHOLD:
+                self.corner_sustain_count += 1
+                if self.corner_sustain_count >= self.CORNER_SUSTAIN_FRAMES:
+                    # Finalize current vertical segment at corner!
+                    corner_y = self.max_reach
+                    corner_cell = (locked_x, corner_y, self.depth_z)
+                    self.all_completed_segments.append((self.anchor_cell, corner_cell))
+
+                    # Start new horizontal segment at corner_cell
+                    self.anchor_cell = corner_cell
+                    self.anchor_float = (float(locked_x), float(corner_y), float(self.depth_z))
+                    self.locked_axis = 'H'
+                    self.locked_coord = corner_y # lock Y to corner_y
+                    self.max_reach = corner_cell[0]
+                    self.corner_sustain_count = 0
+                    return self.add_point(float_pos)
+            else:
+                self.corner_sustain_count = 0
+                reach_dir = 1 if (cur_gy >= self.anchor_cell[1]) else -1
+                if reach_dir == 1 and cur_gy > self.max_reach:
+                    self.max_reach = cur_gy
+                elif reach_dir == -1 and cur_gy < self.max_reach:
+                    self.max_reach = cur_gy
+
+            active_cell = (locked_x, cur_gy, self.depth_z)
+
+        else:
+            # CURVE mode: follows smoothed continuous path
+            cur_gx = int(round(fx))
+            cur_gy = int(round(fy))
+            active_cell = (cur_gx, cur_gy, self.depth_z)
+
+        # Snap closed loop if near start point after drawing at least 3 completed segments
+        if len(self.all_completed_segments) >= 3 and self.start_cell is not None:
+            d_start = max(abs(active_cell[0] - self.start_cell[0]),
+                          abs(active_cell[1] - self.start_cell[1]))
+            if d_start <= 1:
+                active_cell = self.start_cell
+
+        self.active_cell = active_cell
+        self.last_cell = active_cell
+
+        # Build full deterministic stroke path from all completed segments + active segment
+        cells = []
+        seen = set()
+        for (seg_p0, seg_p1) in self.all_completed_segments:
+            for c in interpolate_3d_line(seg_p0, seg_p1):
+                if c not in seen:
+                    seen.add(c)
+                    cells.append(c)
+
+        for c in interpolate_3d_line(self.anchor_cell, self.active_cell):
+            if c not in seen:
+                seen.add(c)
+                cells.append(c)
+
+        self.stroke_cells = cells
+        self.stroke_set = seen
+        return active_cell
+
+
 class EMA:
     def __init__(self, alpha=0.35, initial=None):
         self.alpha = alpha
@@ -101,82 +287,88 @@ class GestureProcessor:
     PINKY_DIP = 19
     PINKY_TIP = 20
 
-    # Gesture states & labels
-    STATE_READY       = "READY • PINCH TO PAINT"
-    STATE_PAINTING    = "PAINTING • STROKE ACTIVE"
-    STATE_COMMITTED   = "STROKE COMMITTED"
-    STATE_CANCELLED   = "CANCELLED • FIST"
-    STATE_ROTATE      = "ROTATING • ROTATE ↻"
-    STATE_ZOOM_IN     = "ZOOMING IN • ZOOM IN ↑"
-    STATE_ZOOM_OUT    = "ZOOMING OUT • ZOOM OUT ↓"
-    STATE_ZOOM_HOLD   = "ZOOM MODE"
-    STATE_FIST        = "STOPPED • FIST"
-    STATE_NOHAND      = "IDLE • NO HAND"
-
-    MODE_ROTATE = "MODE_ROTATE"
-    MODE_INDEX  = "MODE_INDEX"
-    MODE_FIST   = "MODE_FIST"
+    # Strict Action States
+    STATE_IDLE     = "IDLE"
+    STATE_PAINT    = "PAINT"
+    STATE_ROTATE   = "ROTATE"
+    STATE_ZOOM_IN  = "ZOOM_IN"
+    STATE_ZOOM_OUT = "ZOOM_OUT"
+    STATE_ERASE    = "ERASE"
 
     def __init__(self, frame_w=640, frame_h=480, grid_range=(7, 5, 4)):
         self.frame_w = frame_w
         self.frame_h = frame_h
         self.max_gx, self.max_gy, self.max_gz = grid_range
 
+        # Active State Machine
+        self.state = self.STATE_IDLE
+
+        # Gesture Confirmation Debounce
+        self.candidate_raw = self.STATE_IDLE
+        self.candidate_frames = 0
+        self.CONFIRM_FRAMES_DEFAULT = 3
+        self.CONFIRM_FRAMES_ERASE = 6
+
         # Smoothing for world grid target position
         self.ema_cur_x = EMA(alpha=0.40, initial=0.0)
         self.ema_cur_y = EMA(alpha=0.40, initial=0.0)
         self.ema_cur_z = EMA(alpha=0.30, initial=0.0)
 
-        # Smoothing for palm rotation tracking (slow and smooth)
-        self.ema_palm_x = EMA(alpha=0.35, initial=None)
-        self.ema_palm_y = EMA(alpha=0.35, initial=None)
+        # Palm center smoothing for rotation
+        self.ema_palm_x = EMA(alpha=0.30, initial=None)
+        self.ema_palm_y = EMA(alpha=0.30, initial=None)
+        self.prev_palm_pos = None
 
-        # 3D View rotation angles (accumulated)
-        self.rot_x = 18.0
+        # 3D View rotation angles (degrees)
+        self.rot_x = 22.0
         self.rot_y = -30.0
         self.rot_z = 0.0
+
+        # Rotation smoothness parameters
+        self.ROT_SENSITIVITY = 0.40
+        self.ROT_SMOOTHING = 0.30
+        self.MAX_ROT_PER_FRAME = 4.5
+        self.ROT_DEADZONE = 2.0
 
         # Zoom limits and sensitivity
         self.scale = 0.85
         self.MIN_SCALE = 0.35
         self.MAX_SCALE = 2.40
-        self.ZOOM_SENSITIVITY = 0.0035
+        self.ZOOM_STEP_RATE = 0.012  # Controlled zoom step per frame
+
         self.ref_hand_size = 115.0
 
-        # State debounce / confirmation
-        self.current_mode = self.MODE_FIST
-        self.candidate_mode = self.MODE_FIST
-        self.candidate_frames = 0
-        self.CONFIRM_FRAMES = 2
-
-        # 3D PAINTING STROKE SYSTEM
+        # Geometric Stroke Engine (straight line lock, sharp corners, curve preservation, zero gaps)
+        self.stroke_builder = GeometricStrokeBuilder()
         self.is_painting = False
         self.stroke_count = 0
-        self.current_stroke = []        # list of (gx, gy, gz) in order
-        self.current_stroke_set = set() # fast O(1) duplicate check
+        self.current_stroke = []        # list of (gx, gy, gz)
+        self.current_stroke_set = set() # O(1) duplicate check
         self.last_stroke_cell = None
 
-        self.pinch_start_frames = 0
-        self.pinch_release_frames = 0
-        self.committed_timer = 0
+        # Erase system
+        self.erase_target = None
+        self.erase_hold_frames = 0
+        self.ERASE_HOLD_REQUIRED = 8
+        self.erase_cooldown = 0
+        self.last_erased_cell = None
 
-        # Two-hand tracking for Zoom
-        self.prev_hands_dist = None
-        self.zoom_action_label = "ZOOM MODE"
-
-        # Palm position tracking for rotation
-        self.prev_palm_center = None
-
-        # Stable quantized grid cell with hysteresis
+        # Stable quantized grid cell
         self.current_gx = 0
         self.current_gy = 0
         self.current_gz = 0
 
+        # Directional feedback strings
+        self.rotation_dir_str = ""
+        self.zoom_dir_str = ""
+
+        # Last output state cache
         self.last_state = {
-            "state_label": self.STATE_NOHAND,
-            "mode_badge": "MODE: READY",
-            "action_badge": "",
-            "gesture": "STOP",
+            "state": self.STATE_IDLE,
+            "mode_badge": "READY",
+            "action_badge": "PINCH TO PAINT",
+            "sub_badge": "STOPPED",
+            "direction_badge": "",
             "grid_pos": (0, 0, 0),
             "rot_x": self.rot_x,
             "rot_y": self.rot_y,
@@ -188,12 +380,12 @@ class GestureProcessor:
             "preview_active": False,
             "is_rotating": False,
             "is_zooming": False,
+            "is_erasing": False,
+            "erase_cell": None,
             "num_hands": 0,
             "hand_visible": False,
             "index_pos": None,
             "palm_pos": None,
-            "confidence": 0,
-            "pinch_ratio": 1.0,
             "stroke_count": 0,
             "stroke_len": 0,
         }
@@ -260,7 +452,7 @@ class GestureProcessor:
                 d3_mcp_tip = math.sqrt((nmcp[0]-ntip[0])**2 + (nmcp[1]-ntip[1])**2 + (nmcp[2]-ntip[2])**2)
                 d3_mcp_pip = math.sqrt((nmcp[0]-npip[0])**2 + (nmcp[1]-npip[1])**2 + (nmcp[2]-npip[2])**2)
                 if d3_mcp_pip > 1e-4:
-                    is_ext_3d = (d3_mcp_tip / d3_mcp_pip) > 1.35
+                    is_ext_3d = (d3_mcp_tip / d3_mcp_pip) > 1.32
 
             is_ext_2d = (d_wrist_tip > d_wrist_pip * 1.08) and (d_mcp_tip > d_mcp_pip * 1.12)
 
@@ -287,26 +479,89 @@ class GestureProcessor:
 
         return extended
 
-    def _determine_raw_mode(self, lm, norm_lm=None):
+    def _detect_hand_fist(self, lm):
+        """Returns True if a hand is tightly clenched into a fist."""
+        f = self._classify_fingers(lm)
+        return f["extended_count"] == 0
+
+    def _detect_hand_open_palm(self, lm):
+        """Returns True if a hand is an open palm (4 fingers extended)."""
+        f = self._classify_fingers(lm)
+        return f["extended_count"] >= 3
+
+    def _detect_raw_candidate(self, lm, norm_lm, all_hands):
+        """
+        Evaluates raw hand geometry and returns a raw candidate state:
+        STATE_ZOOM_IN, STATE_ZOOM_OUT, STATE_ROTATE, STATE_ERASE, STATE_PAINT, or STATE_IDLE.
+        """
+        num_hands = len(all_hands) if all_hands is not None else 1
+
+        # ---------------------------------------------------------
+        # 1. TWO-HAND GESTURES (ZOOM IN vs ZOOM OUT)
+        # ---------------------------------------------------------
+        if num_hands >= 2 and all_hands is not None and len(all_hands) >= 2:
+            h0 = all_hands[0]
+            h1 = all_hands[1]
+            if len(h0) >= 21 and len(h1) >= 21:
+                h0_palm = self._detect_hand_open_palm(h0)
+                h1_palm = self._detect_hand_open_palm(h1)
+                h0_fist = self._detect_hand_fist(h0)
+                h1_fist = self._detect_hand_fist(h1)
+
+                # GESTURE: TWO OPEN PALMS -> ZOOM IN
+                if h0_palm and h1_palm:
+                    return self.STATE_ZOOM_IN
+
+                # GESTURE: TWO CLOSED FISTS -> ZOOM OUT
+                if h0_fist and h1_fist:
+                    return self.STATE_ZOOM_OUT
+
+            return self.STATE_IDLE
+
+        # ---------------------------------------------------------
+        # 2. SINGLE-HAND GESTURES
+        # ---------------------------------------------------------
         f = self._classify_fingers(lm, norm_lm)
         ext_count = f["extended_count"]
-        tot_count = f["total_extended"]
+        size = self._hand_size(lm)
 
-        # PRIORITY 1: WHOLE OPEN PALM (3 or 4 fingers extended) -> ROTATE
-        if ext_count >= 3 or tot_count >= 4:
-            return self.MODE_ROTATE
+        d_index_thumb = self._dist(lm[self.THUMB_TIP], lm[self.INDEX_TIP])
+        ratio_index_thumb = d_index_thumb / size
 
-        # PRIORITY 2: INDEX FINGER (index extended, others folded) -> INDEX
-        if f["index"] and not f["middle"] and not f["ring"] and not f["pinky"]:
-            return self.MODE_INDEX
+        d_index_middle = self._dist(lm[self.INDEX_TIP], lm[self.MIDDLE_TIP])
+        ratio_index_middle = d_index_middle / size
 
-        # PRIORITY 3: FIST (no main fingers extended) -> FIST
-        if ext_count == 0:
-            return self.MODE_FIST
+        # GESTURE: ONE OPEN PALM -> ROTATE
+        # 3 or 4 fingers extended, thumb free, no pinch
+        if ext_count >= 3 and ratio_index_thumb > 0.40 and ratio_index_middle > 0.28:
+            return self.STATE_ROTATE
 
-        return self.MODE_FIST
+        # GESTURE: INDEX + MIDDLE TOGETHER (PINCH) -> ERASE
+        # Index & middle are extended, ring and pinky are folded,
+        # index and middle tips are pinched together (< 0.22 hand size),
+        # thumb is separated from index (> 0.35 hand size) so not a thumb pinch!
+        if (f["index"] and f["middle"] and not f["ring"] and not f["pinky"]
+                and ratio_index_middle < 0.24 and ratio_index_thumb > 0.35):
+            return self.STATE_ERASE
 
-    def update(self, landmarks, norm_landmarks=None, all_hands=None):
+        # GESTURE: INDEX + THUMB PINCH -> PAINT
+        # Index extended, middle/ring/pinky folded, thumb pinched to index tip
+        if f["index"] and not f["ring"] and not f["pinky"] and ratio_index_thumb < 0.32:
+            return self.STATE_PAINT
+
+        # If finger is pointing (Index extended only) without pinch:
+        # If we are already painting, we remain in PAINT until release hysteresis!
+        if self.state == self.STATE_PAINT:
+            # Check release threshold (0.48):
+            if ratio_index_thumb > 0.48:
+                return self.STATE_IDLE
+            else:
+                return self.STATE_PAINT
+
+        # Default single hand state
+        return self.STATE_IDLE
+
+    def update(self, landmarks, norm_landmarks=None, all_hands=None, existing_blocks=None, camera_r=None):
         if landmarks is None or len(landmarks) < 21:
             return self.hold()
 
@@ -315,331 +570,346 @@ class GestureProcessor:
         index_tip = lm[self.INDEX_TIP]
         middle_mcp = lm[self.MIDDLE_MCP]
         size = self._hand_size(lm)
+
         palm_x = (wrist[0] + middle_mcp[0]) * 0.5
         palm_y = (wrist[1] + middle_mcp[1]) * 0.5
-        d_pinch = self._dist(lm[self.THUMB_TIP], lm[self.INDEX_TIP])
-        pinch_ratio = d_pinch / size
-
         num_hands = len(all_hands) if all_hands is not None else 1
 
+        # Decrement erase cooldown if active
+        if self.erase_cooldown > 0:
+            self.erase_cooldown -= 1
+
         # -------------------------------------------------------------
-        # 4. INTERACTION STATE MACHINE (ZOOM vs ROTATE vs PAINT vs FIST)
+        # STEP 1: DETECT RAW GESTURE CANDIDATE
         # -------------------------------------------------------------
-        # RULE 1: When TWO hands are detected:
-        # -> ZOOM MODE (rotation disabled, painting disabled)
-        #
-        # RULE 2: When ONE open palm is detected:
-        # -> ROTATE MODE (zoom disabled, painting disabled)
-        #
-        # RULE 3: When painting:
-        # -> PAINT MODE (rotation disabled, zoom disabled)
-        #
-        # RULE 4: Fist cancels active action / Stop.
+        raw_candidate = self._detect_raw_candidate(lm, norm_landmarks, all_hands)
+
         # -------------------------------------------------------------
+        # STEP 2: CONFIRMATION DEBOUNCE (NO RANDOM TRIGGERING)
+        # -------------------------------------------------------------
+        # Require consecutive frames before committing a state change
+        required_frames = self.CONFIRM_FRAMES_ERASE if raw_candidate == self.STATE_ERASE else self.CONFIRM_FRAMES_DEFAULT
 
-        is_zooming = False
-        zoom_badge = ""
-        is_rotating = False
-        commit_stroke = []
-        mode_badge = "MODE: READY"
-        action_badge = ""
-        state_label = self.STATE_READY
-
-        # CHECK TWO HANDS FOR ZOOM MODE
-        if num_hands >= 2 and all_hands is not None and len(all_hands) >= 2:
-            # Cancel or commit any painting stroke if user suddenly presents two hands
-            if self.is_painting and self.current_stroke:
-                commit_stroke = list(self.current_stroke)
-                self.is_painting = False
-                self.current_stroke = []
-                self.current_stroke_set = set()
-                self.last_stroke_cell = None
-
-            w0 = all_hands[0][0]
-            w1 = all_hands[1][0]
-            current_dist = math.hypot(w0[0] - w1[0], w0[1] - w1[1])
-
-            if self.prev_hands_dist is not None:
-                delta_d = current_dist - self.prev_hands_dist
-                # Deadzone: ignore jitter < 2.5px
-                if abs(delta_d) > 2.5:
-                    # Low sensitivity zoom step
-                    zoom_change = delta_d * self.ZOOM_SENSITIVITY
-                    # Max zoom change per frame clamp (0.045) to prevent jumping
-                    zoom_change = max(-0.045, min(0.045, zoom_change))
-                    new_scale = self.scale * (1.0 + zoom_change)
-                    # Min and Max limits: prevent entering hologrid or zooming infinitely far
-                    self.scale = max(self.MIN_SCALE, min(self.MAX_SCALE, new_scale))
-                    is_zooming = True
-
-                    if delta_d > 0:
-                        mode_badge = "MODE: ZOOMING IN"
-                        action_badge = "ZOOM IN ↑"
-                        state_label = self.STATE_ZOOM_IN
-                    else:
-                        mode_badge = "MODE: ZOOMING OUT"
-                        action_badge = "ZOOM OUT ↓"
-                        state_label = self.STATE_ZOOM_OUT
-                else:
-                    is_zooming = True
-                    mode_badge = "MODE: ZOOM"
-                    action_badge = "ZOOM MODE"
-                    state_label = self.STATE_ZOOM_HOLD
-
-            self.prev_hands_dist = current_dist
-            self.prev_palm_center = None
-            self.pinch_start_frames = 0
-            self.pinch_release_frames = 0
-
+        if raw_candidate == self.candidate_raw:
+            self.candidate_frames += 1
         else:
-            self.prev_hands_dist = None
+            self.candidate_raw = raw_candidate
+            self.candidate_frames = 1
 
-            # ONE HAND DETECTED: Determine gesture mode
-            raw_mode = self._determine_raw_mode(lm, norm_landmarks)
+        # Determine if candidate is confirmed
+        target_state = self.state
+        if self.candidate_frames >= required_frames:
+            target_state = self.candidate_raw
 
-            if raw_mode == self.candidate_mode:
-                self.candidate_frames += 1
-                if self.candidate_frames >= self.CONFIRM_FRAMES:
-                    self.current_mode = raw_mode
+        # -------------------------------------------------------------
+        # STEP 3: STRICT STATE MACHINE TRANSITIONS (MUTUALLY EXCLUSIVE)
+        # -------------------------------------------------------------
+        commit_stroke = []
+        erase_cell = None
+
+        # Exit handler for PAINT
+        if self.state == self.STATE_PAINT and target_state != self.STATE_PAINT:
+            if self.current_stroke:
+                commit_stroke = list(self.current_stroke)
+            self.is_painting = False
+            self.current_stroke = []
+            self.current_stroke_set = set()
+            self.last_stroke_cell = None
+            self.stroke_builder.reset()
+
+        # Exit handler for ROTATE
+        if self.state == self.STATE_ROTATE and target_state != self.STATE_ROTATE:
+            self.prev_palm_pos = None
+            self.ema_palm_x.value = None
+            self.ema_palm_y.value = None
+            self.rotation_dir_str = ""
+
+        # Exit handler for ERASE
+        if self.state == self.STATE_ERASE and target_state != self.STATE_ERASE:
+            self.erase_target = None
+            self.erase_hold_frames = 0
+
+        # Exit handler for ZOOM
+        if self.state in (self.STATE_ZOOM_IN, self.STATE_ZOOM_OUT) and target_state not in (self.STATE_ZOOM_IN, self.STATE_ZOOM_OUT):
+            self.zoom_dir_str = ""
+
+        # Commit confirmed state
+        self.state = target_state
+
+        # -------------------------------------------------------------
+        # STEP 4: 3D GRID COORDINATE MAPPING (CURSOR)
+        # -------------------------------------------------------------
+        view_x = (index_tip[0] - self.frame_w * 0.5) / (self.frame_w * 0.38)
+        view_y = -(index_tip[1] - self.frame_h * 0.5) / (self.frame_h * 0.38)
+        view_x = max(-1.25, min(1.25, view_x))
+        view_y = max(-1.25, min(1.25, view_y))
+
+        view_z = (size - self.ref_hand_size) / 45.0
+        view_z = max(-1.25, min(1.25, view_z))
+
+        target_cam = np.array([view_x * self.max_gx,
+                               view_y * self.max_gy,
+                               view_z * self.max_gz], dtype=np.float64)
+
+        if camera_r is not None:
+            rot_mat = camera_r
+        else:
+            rot_mat = self.get_rotation_matrix()
+        target_world = rot_mat.T @ target_cam
+
+        smooth_wx = self.ema_cur_x.update(target_world[0])
+        smooth_wy = self.ema_cur_y.update(target_world[1])
+        smooth_wz = self.ema_cur_z.update(target_world[2])
+
+        raw_gx = int(round(smooth_wx))
+        raw_gy = int(round(smooth_wy))
+        raw_gz = int(round(smooth_wz))
+
+        raw_gx = max(-self.max_gx, min(self.max_gx, raw_gx))
+        raw_gy = max(-self.max_gy, min(self.max_gy, raw_gy))
+        raw_gz = max(-self.max_gz, min(self.max_gz, raw_gz))
+
+        if abs(smooth_wx - self.current_gx) > 0.52:
+            self.current_gx = raw_gx
+        if abs(smooth_wy - self.current_gy) > 0.52:
+            self.current_gy = raw_gy
+        if abs(smooth_wz - self.current_gz) > 0.52:
+            self.current_gz = raw_gz
+
+        current_grid_pos = (self.current_gx, self.current_gy, self.current_gz)
+
+        # -------------------------------------------------------------
+        # STEP 5: EXECUTE ACTIVE MUTUALLY EXCLUSIVE ACTION
+        # -------------------------------------------------------------
+        mode_badge = "READY"
+        action_badge = "PINCH TO PAINT"
+        sub_badge = "STOPPED"
+        direction_badge = ""
+
+        # === STATE: PAINT ===
+        if self.state == self.STATE_PAINT:
+            float_pos = (smooth_wx, smooth_wy, smooth_wz)
+            if not self.is_painting:
+                # Enter paint stroke
+                self.is_painting = True
+                self.stroke_count += 1
+                self.stroke_builder.start(float_pos)
+                active_cursor_cell = self.stroke_builder.active_cell
+                self.current_stroke = list(self.stroke_builder.stroke_cells)
+                self.current_stroke_set = set(self.stroke_builder.stroke_set)
+                self.last_stroke_cell = self.stroke_builder.last_cell
             else:
-                self.candidate_mode = raw_mode
-                self.candidate_frames = 1
+                # Intelligent Segment-Based Sticky-Axis Geometric Path Generation
+                active_cursor_cell = self.stroke_builder.add_point(float_pos)
+                self.current_stroke = list(self.stroke_builder.stroke_cells)
+                self.current_stroke_set = set(self.stroke_builder.stroke_set)
+                self.last_stroke_cell = self.stroke_builder.last_cell
 
-            palm_x = (wrist[0] + middle_mcp[0]) * 0.5
-            palm_y = (wrist[1] + middle_mcp[1]) * 0.5
+            # Magnetically lock the cursor position on the grid
+            current_grid_pos = active_cursor_cell
+            self.current_gx, self.current_gy, self.current_gz = active_cursor_cell
 
-            d_pinch = self._dist(lm[self.THUMB_TIP], lm[self.INDEX_TIP])
-            pinch_ratio = d_pinch / size
-
-            # ---------------------------------------------------------
-            # MODE: ROTATE — ONE OPEN PALM
-            # ---------------------------------------------------------
-            if self.current_mode == self.MODE_ROTATE and not self.is_painting:
-                is_rotating = True
-                mode_badge = "MODE: ROTATING"
-                action_badge = "ROTATE ↻"
-                state_label = self.STATE_ROTATE
-
-                self.pinch_start_frames = 0
-                self.pinch_release_frames = 0
-
-                smooth_px = self.ema_palm_x.update(palm_x)
-                smooth_py = self.ema_palm_y.update(palm_y)
-
-                if self.prev_palm_center is not None:
-                    dx = smooth_px - self.prev_palm_center[0]
-                    dy = smooth_py - self.prev_palm_center[1]
-
-                    # Deadzone (2.0px) to eliminate MediaPipe jitter
-                    # Clamp max rotation per frame (2.5 deg) for slow, natural rotation
-                    ROT_SENSITIVITY = 0.28
-                    MAX_ROT_STEP = 2.5
-
-                    if abs(dx) > 2.0:
-                        rot_step_y = max(-MAX_ROT_STEP, min(MAX_ROT_STEP, dx * ROT_SENSITIVITY))
-                        self.rot_y += rot_step_y
-
-                    if abs(dy) > 2.0:
-                        rot_step_x = max(-MAX_ROT_STEP, min(MAX_ROT_STEP, -dy * ROT_SENSITIVITY))
-                        self.rot_x += rot_step_x
-
-                self.prev_palm_center = (smooth_px, smooth_py)
-
+            # Axis lock status indicator
+            if self.stroke_builder.locked_axis == 'H':
+                axis_str = f"LOCKED ROW Y={self.stroke_builder.locked_coord}"
+            elif self.stroke_builder.locked_axis == 'V':
+                axis_str = f"LOCKED COL X={self.stroke_builder.locked_coord}"
+            elif self.stroke_builder.locked_axis == 'CURVE':
+                axis_str = "FREEHAND CURVE"
             else:
-                self.prev_palm_center = None
-                self.ema_palm_x.value = None
-                self.ema_palm_y.value = None
+                axis_str = "ALIGNING INTENT..."
 
-            # ---------------------------------------------------------
-            # MODE: FIST — STOP / CANCEL
-            # ---------------------------------------------------------
-            if self.current_mode == self.MODE_FIST and not is_rotating:
-                if self.is_painting:
-                    # Cancel in-progress stroke on fist!
-                    self.is_painting = False
-                    self.current_stroke = []
-                    self.current_stroke_set = set()
-                    self.last_stroke_cell = None
-                    mode_badge = "MODE: STOPPED"
-                    action_badge = "FIST CANCEL"
-                    state_label = self.STATE_CANCELLED
+            mode_badge = "PAINTING"
+            action_badge = "DRAWING STROKE"
+            sub_badge = f"STROKE {self.stroke_count:02d} ({len(self.current_stroke)} BLOCKS)"
+            direction_badge = axis_str
+
+        # === STATE: ROTATE ===
+        elif self.state == self.STATE_ROTATE:
+            smooth_px = self.ema_palm_x.update(palm_x)
+            smooth_py = self.ema_palm_y.update(palm_y)
+
+            rot_pitch_delta = 0.0
+            rot_yaw_delta = 0.0
+
+            # Rotation lock: first frame captures reference
+            if self.prev_palm_pos is not None:
+                dx = smooth_px - self.prev_palm_pos[0]
+                dy = smooth_py - self.prev_palm_pos[1]
+
+                h_dir = ""
+                v_dir = ""
+
+                # Move Palm Right -> Rotate Horizontally Right (+yaw)
+                # Move Palm Left  -> Rotate Horizontally Left (-yaw)
+                if abs(dx) > self.ROT_DEADZONE:
+                    rot_yaw_delta = max(-self.MAX_ROT_PER_FRAME, min(self.MAX_ROT_PER_FRAME, dx * self.ROT_SENSITIVITY))
+                    self.rot_y = (self.rot_y + rot_yaw_delta) % 360.0
+                    h_dir = "ROTATE RIGHT →" if dx > 0 else "← ROTATE LEFT"
+
+                # Move Palm Up    -> Rotate Vertically Up (+pitch)
+                # Move Palm Down  -> Rotate Vertically Down (-pitch)
+                if abs(dy) > self.ROT_DEADZONE:
+                    rot_pitch_delta = max(-self.MAX_ROT_PER_FRAME, min(self.MAX_ROT_PER_FRAME, -dy * self.ROT_SENSITIVITY))
+                    self.rot_x = max(-75.0, min(85.0, self.rot_x + rot_pitch_delta))
+                    v_dir = "↑ ROTATE UP" if dy < 0 else "↓ ROTATE DOWN"
+
+                if h_dir and v_dir:
+                    self.rotation_dir_str = f"{h_dir}  |  {v_dir}"
+                elif h_dir:
+                    self.rotation_dir_str = h_dir
+                elif v_dir:
+                    self.rotation_dir_str = v_dir
                 else:
-                    mode_badge = "MODE: STOPPED"
-                    action_badge = "FIST"
-                    state_label = self.STATE_FIST
+                    self.rotation_dir_str = "PALM STEADY"
 
-                self.pinch_start_frames = 0
-                self.pinch_release_frames = 0
+            self.prev_palm_pos = (smooth_px, smooth_py)
 
-            # ---------------------------------------------------------
-            # MODE: INDEX FINGER — 3D CONTINUOUS PAINTING
-            # ---------------------------------------------------------
-            elif self.current_mode == self.MODE_INDEX and not is_rotating:
-                # 1. Screen / camera coordinates -> 3D Hologrid space
-                view_x = (index_tip[0] - self.frame_w * 0.5) / (self.frame_w * 0.38)
-                view_y = -(index_tip[1] - self.frame_h * 0.5) / (self.frame_h * 0.38)
-                view_x = max(-1.25, min(1.25, view_x))
-                view_y = max(-1.25, min(1.25, view_y))
+            mode_badge = "ROTATING"
+            action_badge = "← MOVE PALM →"
+            sub_badge = "ONE OPEN PALM"
+            direction_badge = self.rotation_dir_str
 
-                view_z = (size - self.ref_hand_size) / 45.0
-                view_z = max(-1.25, min(1.25, view_z))
+        # === STATE: ZOOM IN ===
+        elif self.state == self.STATE_ZOOM_IN:
+            new_scale = self.scale * (1.0 + self.ZOOM_STEP_RATE)
+            self.scale = max(self.MIN_SCALE, min(self.MAX_SCALE, new_scale))
 
-                target_cam = np.array([view_x * self.max_gx,
-                                       view_y * self.max_gy,
-                                       view_z * self.max_gz], dtype=np.float64)
+            mode_badge = "ZOOM IN"
+            action_badge = "↑ CLOSER"
+            sub_badge = "TWO OPEN PALMS"
+            direction_badge = f"ZOOM IN: {self.scale:.2f}x"
 
-                rot_mat = self.get_rotation_matrix()
-                target_world = rot_mat.T @ target_cam
+        # === STATE: ZOOM OUT ===
+        elif self.state == self.STATE_ZOOM_OUT:
+            new_scale = self.scale * (1.0 - self.ZOOM_STEP_RATE)
+            self.scale = max(self.MIN_SCALE, min(self.MAX_SCALE, new_scale))
 
-                smooth_wx = self.ema_cur_x.update(target_world[0])
-                smooth_wy = self.ema_cur_y.update(target_world[1])
-                smooth_wz = self.ema_cur_z.update(target_world[2])
+            mode_badge = "ZOOM OUT"
+            action_badge = "↓ FARTHER"
+            sub_badge = "TWO CLOSED FISTS"
+            direction_badge = f"ZOOM OUT: {self.scale:.2f}x"
 
-                raw_gx = int(round(smooth_wx))
-                raw_gy = int(round(smooth_wy))
-                raw_gz = int(round(smooth_wz))
+        # === STATE: ERASE ===
+        elif self.state == self.STATE_ERASE:
+            mode_badge = "ERASING"
+            action_badge = "SELECT BLOCK"
+            sub_badge = "INDEX + MIDDLE"
 
-                raw_gx = max(-self.max_gx, min(self.max_gx, raw_gx))
-                raw_gy = max(-self.max_gy, min(self.max_gy, raw_gy))
-                raw_gz = max(-self.max_gz, min(self.max_gz, raw_gz))
-
-                if abs(smooth_wx - self.current_gx) > 0.52:
-                    self.current_gx = raw_gx
-                if abs(smooth_wy - self.current_gy) > 0.52:
-                    self.current_gy = raw_gy
-                if abs(smooth_wz - self.current_gz) > 0.52:
-                    self.current_gz = raw_gz
-
-                current_pos = (self.current_gx, self.current_gy, self.current_gz)
-
-                # PINCH DETECTION & STROKE STATE MACHINE
-                PINCH_START_THRESHOLD   = 0.30
-                PINCH_RELEASE_THRESHOLD = 0.48
-
-                if not self.is_painting:
-                    # Idle / Ready: check if user starts a new paint stroke
-                    if pinch_ratio < PINCH_START_THRESHOLD:
-                        self.pinch_start_frames += 1
-                        if self.pinch_start_frames >= 2:
-                            # START PAINTING SESSION!
-                            self.is_painting = True
-                            self.stroke_count += 1
-                            self.current_stroke = [current_pos]
-                            self.current_stroke_set = {current_pos}
-                            self.last_stroke_cell = current_pos
-                            self.pinch_start_frames = 0
-                            self.pinch_release_frames = 0
-                            mode_badge = "MODE: PAINTING"
-                            action_badge = "STROKE ACTIVE"
-                            state_label = f"PAINTING • STROKE {self.stroke_count:02d}"
-                    else:
-                        self.pinch_start_frames = 0
-                        mode_badge = "MODE: READY"
-                        action_badge = "PINCH TO DRAW"
-                        if self.committed_timer > 0:
-                            self.committed_timer -= 1
-                            state_label = "STROKE COMPLETE • PINCH TO DRAW AGAIN"
-                        else:
-                            state_label = self.STATE_READY
-
+            # Check if cursor is on an existing block
+            target_pos = current_grid_pos
+            if existing_blocks is not None and target_pos in existing_blocks:
+                if target_pos == self.erase_target:
+                    self.erase_hold_frames += 1
                 else:
-                    # Currently PAINTING: user moves index finger to draw continuous path!
-                    if pinch_ratio > PINCH_RELEASE_THRESHOLD:
-                        self.pinch_release_frames += 1
-                        if self.pinch_release_frames >= 2:
-                            # FINISH & COMMIT STROKE!
-                            self.is_painting = False
-                            commit_stroke = list(self.current_stroke)
-                            self.current_stroke = []
-                            self.current_stroke_set = set()
-                            self.last_stroke_cell = None
-                            self.pinch_release_frames = 0
-                            self.committed_timer = 30
-                            mode_badge = "MODE: READY"
-                            action_badge = "COMMITTED"
-                            state_label = f"STROKE {self.stroke_count:02d} COMMITTED ({len(commit_stroke)} BLOCKS)"
-                    else:
-                        self.pinch_release_frames = 0
-                        # Continuously connect every movement with ZERO GAPS (3D DDA)
-                        if current_pos != self.last_stroke_cell and self.last_stroke_cell is not None:
-                            segment = interpolate_3d_line(self.last_stroke_cell, current_pos)
-                            for cell in segment:
-                                if cell not in self.current_stroke_set:
-                                    self.current_stroke.append(cell)
-                                    self.current_stroke_set.add(cell)
-                            self.last_stroke_cell = current_pos
+                    self.erase_target = target_pos
+                    self.erase_hold_frames = 1
 
-                        mode_badge = "MODE: PAINTING"
-                        action_badge = "STROKE ACTIVE"
-                        state_label = f"PAINTING • STROKE: {self.stroke_count:02d} ({len(self.current_stroke)} BLOCKS)"
+                direction_badge = f"HOLD OVER ({target_pos[0]}, {target_pos[1]}, {target_pos[2]}) [{self.erase_hold_frames}/{self.ERASE_HOLD_REQUIRED}]"
 
-        confidence_pct = min(100, int((self.candidate_frames / self.CONFIRM_FRAMES) * 100)) if self.candidate_frames > 0 else 100
+                # One confirmed erase action -> One block removed
+                if self.erase_hold_frames >= self.ERASE_HOLD_REQUIRED and self.erase_cooldown == 0:
+                    erase_cell = target_pos
+                    self.last_erased_cell = target_pos
+                    self.erase_cooldown = 20  # Cooldown before another erase
+                    self.erase_hold_frames = 0
+                    self.erase_target = None
+                    direction_badge = f"BLOCK ({target_pos[0]}, {target_pos[1]}, {target_pos[2]}) ERASED"
+            else:
+                self.erase_target = None
+                self.erase_hold_frames = 0
+                direction_badge = "HOVER OVER TARGET BLOCK"
+
+        # === STATE: IDLE ===
+        else:
+            mode_badge = "READY"
+            action_badge = "PINCH TO PAINT"
+            sub_badge = "STOPPED"
+            direction_badge = "AWAITING GESTURE"
 
         self.last_state = {
-            "state_label": state_label,
+            "state": self.state,
             "mode_badge": mode_badge,
             "action_badge": action_badge,
-            "gesture": "ROTATE" if is_rotating else ("ZOOM" if is_zooming else ("PAINT" if self.is_painting else "IDLE")),
-            "grid_pos": (self.current_gx, self.current_gy, self.current_gz),
+            "sub_badge": sub_badge,
+            "direction_badge": direction_badge,
+            "grid_pos": current_grid_pos,
             "rot_x": self.rot_x,
             "rot_y": self.rot_y,
             "rot_z": self.rot_z,
+            "pitch": self.rot_x,
+            "yaw": self.rot_y,
             "scale": self.scale,
-            "is_painting": self.is_painting,
+            "zoom_direction": "IN" if self.state == self.STATE_ZOOM_IN else ("OUT" if self.state == self.STATE_ZOOM_OUT else None),
+            "is_painting": (self.state == self.STATE_PAINT),
             "active_stroke": list(self.current_stroke),
             "commit_stroke": commit_stroke,
-            "preview_active": True if (self.current_mode == self.MODE_INDEX) else False,
-            "is_rotating": is_rotating,
-            "is_zooming": is_zooming,
+            "preview_active": (self.state in (self.STATE_PAINT, self.STATE_ERASE, self.STATE_IDLE)),
+            "is_rotating": (self.state == self.STATE_ROTATE),
+            "is_zooming": (self.state in (self.STATE_ZOOM_IN, self.STATE_ZOOM_OUT)),
+            "is_erasing": (self.state == self.STATE_ERASE),
+            "erase_cell": erase_cell,
             "num_hands": num_hands,
             "hand_visible": True,
             "index_pos": (int(index_tip[0]), int(index_tip[1])),
             "palm_pos": (int(palm_x), int(palm_y)),
-            "confidence": confidence_pct,
-            "pinch_ratio": round(pinch_ratio, 2),
             "stroke_count": self.stroke_count,
             "stroke_len": len(self.current_stroke),
         }
         return self.last_state
 
     def hold(self):
-        """When hand leaves camera view: stop everything immediately."""
+        """When hand leaves camera view: stop everything safely."""
         commit_stroke = []
         if self.is_painting and self.current_stroke:
             commit_stroke = list(self.current_stroke)
 
-        self.current_mode = self.MODE_FIST
-        self.candidate_mode = self.MODE_FIST
+        self.state = self.STATE_IDLE
+        self.candidate_raw = self.STATE_IDLE
         self.candidate_frames = 0
         self.is_painting = False
         self.current_stroke = []
         self.current_stroke_set = set()
         self.last_stroke_cell = None
-        self.pinch_start_frames = 0
-        self.pinch_release_frames = 0
-        self.prev_palm_center = None
-        self.prev_hands_dist = None
+        self.prev_palm_pos = None
+        self.erase_target = None
+        self.erase_hold_frames = 0
+        self.rotation_dir_str = ""
+        self.zoom_dir_str = ""
 
-        self.last_state["state_label"] = self.STATE_NOHAND
-        self.last_state["mode_badge"] = "MODE: STOPPED"
-        self.last_state["action_badge"] = "NO HAND"
-        self.last_state["gesture"] = "STOP"
-        self.last_state["is_painting"] = False
-        self.last_state["active_stroke"] = []
-        self.last_state["commit_stroke"] = commit_stroke
-        self.last_state["preview_active"] = False
-        self.last_state["is_rotating"] = False
-        self.last_state["is_zooming"] = False
-        self.last_state["num_hands"] = 0
-        self.last_state["hand_visible"] = False
-        self.last_state["confidence"] = 0
-        self.last_state["pinch_ratio"] = 1.0
+        self.last_state = {
+            "state": self.STATE_IDLE,
+            "mode_badge": "STOPPED",
+            "action_badge": "NO HAND",
+            "sub_badge": "IDLE",
+            "direction_badge": "HAND NOT DETECTED",
+            "grid_pos": (0, 0, 0),
+            "rot_x": self.rot_x,
+            "rot_y": self.rot_y,
+            "rot_z": self.rot_z,
+            "scale": self.scale,
+            "is_painting": False,
+            "active_stroke": [],
+            "commit_stroke": commit_stroke,
+            "preview_active": False,
+            "is_rotating": False,
+            "is_zooming": False,
+            "is_erasing": False,
+            "erase_cell": None,
+            "num_hands": 0,
+            "hand_visible": False,
+            "index_pos": None,
+            "palm_pos": None,
+            "stroke_count": self.stroke_count,
+            "stroke_len": 0,
+        }
         return dict(self.last_state)
 
     def reset_view(self):
-        self.rot_x = 18.0
+        self.rot_x = 22.0
         self.rot_y = -30.0
         self.rot_z = 0.0
+        self.stroke_builder.reset()
 
     def set_rotation(self, rot_x, rot_y, rot_z=0.0):
         self.rot_x = rot_x

@@ -16,14 +16,24 @@ Features:
 
 import time
 import cv2
+import ctypes
+import numpy as np
 
 from hand_tracker import HandTracker
 from gesture_logic import GestureProcessor
 from cube_engine import CubeEngine
 from hologram_render import HologramRenderer
 
-WIN_W = 1024
-WIN_H = 720
+try:
+    _user32 = ctypes.windll.user32
+    SCREEN_MONITOR_W = _user32.GetSystemMetrics(0)
+    SCREEN_MONITOR_H = _user32.GetSystemMetrics(1)
+except Exception:
+    SCREEN_MONITOR_W = 1280
+    SCREEN_MONITOR_H = 720
+
+WIN_W = min(1280, SCREEN_MONITOR_W - 60)
+WIN_H = min(720, SCREEN_MONITOR_H - 100)
 
 CLEAR_BTN_RECT = (20, 20, 95, 34)
 
@@ -100,7 +110,8 @@ def main():
     renderer = HologramRenderer(width=WIN_W, height=WIN_H)
 
     win_name = "HoloGrid 3D Studio"
-    cv2.namedWindow(win_name)
+    cv2.namedWindow(win_name, cv2.WINDOW_NORMAL)
+    cv2.resizeWindow(win_name, WIN_W, WIN_H)
 
     mouse_params = {"cube": cube}
     cv2.setMouseCallback(win_name, _on_mouse, mouse_params)
@@ -108,18 +119,21 @@ def main():
     prev_drag_pos = None
 
     print("\n=======================================================")
-    print("       HOLOGRID BUILDER — FUTURISTIC 3D STUDIO")
+    print("   HOLOGRID BUILDER — PROFESSIONAL FSM 3D STUDIO")
     print("=======================================================")
-    print(" 🤏 INDEX + THUMB PINCH : START PAINTING")
-    print(" ☝ MOVE INDEX FINGER    : Draw continuous 3D block path")
-    print(" 🤏 RELEASE PINCH       : Finish current stroke & commit")
-    print(" 🖐 ONE OPEN PALM       : Slow & smooth 3D hologrid rotation")
-    print(" 👐 TWO OPEN HANDS      : Zoom (Apart -> IN | Together -> OUT)")
-    print(" ✊ CLOSED FIST         : Stop / Cancel active action")
-    print(" NO HAND                : Safe idle")
-    print(" 'c' / [CLEAR]          : Clear structure | 'u': Undo stroke")
-    print(" 'r'                    : Reset view | Mouse Drag: Rotate")
+    print(" 🤏 INDEX + THUMB PINCH  : START PAINTING")
+    print(" ☝ MOVE INDEX FINGER     : Draw continuous 3D block path")
+    print(" 🤏 RELEASE PINCH        : Commit stroke & return to IDLE")
+    print(" 🖐 ONE OPEN PALM        : 360° Smooth Hologrid Orbit")
+    print(" 👐 TWO OPEN PALMS       : ZOOM IN (Toward Camera)")
+    print(" ✊ TWO CLOSED FISTS     : ZOOM OUT (Farther / Overview)")
+    print(" ☝🖕 INDEX + MIDDLE PINCH : ERASE TARGET BLOCK (Hold to remove)")
+    print(" 'f'                     : Toggle Fullscreen Display")
+    print(" 'c' / [CLEAR]           : Clear structure | 'u': Undo stroke")
+    print(" 'r'                     : Reset view | Mouse Drag: Rotate")
     print("=======================================================\n")
+
+    is_fullscreen = False
 
     try:
         while True:
@@ -128,6 +142,20 @@ def main():
                 continue
 
             frame = cv2.flip(frame, 1)
+
+            # Query dynamic window dimensions (handles window maximizing, resizing, fullscreen)
+            fs_prop = cv2.getWindowProperty(win_name, cv2.WND_PROP_FULLSCREEN)
+            if fs_prop == cv2.WINDOW_FULLSCREEN or is_fullscreen:
+                cur_win_w = SCREEN_MONITOR_W
+                cur_win_h = SCREEN_MONITOR_H
+            else:
+                rect = cv2.getWindowImageRect(win_name)
+                if rect is not None and rect[2] > 100 and rect[3] > 100:
+                    cur_win_w = rect[2]
+                    cur_win_h = rect[3]
+                else:
+                    cur_win_w = WIN_W
+                    cur_win_h = WIN_H
 
             # Handle clear button click
             if mouse_state["clicked_clear"]:
@@ -142,20 +170,21 @@ def main():
                     if prev_drag_pos is not None:
                         pdx = cur_x - prev_drag_pos[0]
                         pdy = cur_y - prev_drag_pos[1]
-                        cube.rotate_nudge(pitch_delta=-pdy * 0.45, yaw_delta=pdx * 0.45)
-                        gestures.set_rotation(cube.rot_x, cube.rot_y, cube.rot_z)
+                        cube.rotate_orbit(pitch_delta=-pdy * 0.40, yaw_delta=pdx * 0.40)
+                        gestures.set_rotation(cube.pitch, cube.yaw)
                     prev_drag_pos = (cur_x, cur_y)
             else:
                 prev_drag_pos = None
 
-            # Process hand tracking
+            # Process hand tracking with synchronized camera view matrix
             result = tracker.process(frame)
             landmarks = result["landmarks"]
             norm_landmarks = result.get("norm_landmarks")
             all_hands = result.get("all_hands")
 
+            cam_r = cube.get_camera_r()
             if landmarks is not None:
-                state = gestures.update(landmarks, norm_landmarks, all_hands)
+                state = gestures.update(landmarks, norm_landmarks, all_hands, existing_blocks=cube.blocks, camera_r=cam_r)
             else:
                 state = gestures.hold()
 
@@ -172,22 +201,34 @@ def main():
                 new_blocks = cube.commit_stroke(commit_cells)
                 print(f"[Stroke Committed] Added {new_blocks} blocks. Total: {len(cube.blocks)} across {len(cube.stroke_history)} strokes.")
 
-            # Apply 3D scene rotation when Open Palm is active
+            # Dedicated erase action execution (one confirmed block removed)
+            erase_cell = state.get("erase_cell")
+            if erase_cell is not None:
+                cube.remove_block(erase_cell[0], erase_cell[1], erase_cell[2])
+                print(f"[Erase Committed] Removed block at {erase_cell}. Remaining: {len(cube.blocks)}.")
+
+            # Apply 3D scene orbit rotation when One Open Palm is active (full 360 wrap)
             if state["is_rotating"]:
-                cube.set_transform(state["rot_x"], state["rot_y"], state["rot_z"])
+                cube.set_orbit(state["pitch"], state["yaw"])
 
-            # Sync two-hand zoom scale
-            cube.scale = state["scale"]
+            # Handle dedicated Zoom In / Zoom Out gestures
+            zoom_dir = state.get("zoom_direction")
+            if zoom_dir == "IN":
+                cube.zoom_in(factor=0.985)
+            elif zoom_dir == "OUT":
+                cube.zoom_out(factor=1.015)
 
-            # Project 3D geometry (ground grid, blocks, active stroke preview, cursor)
-            screen_data = cube.get_screen_data(WIN_W, WIN_H)
+            # Project 3D geometry with dynamic viewport resolution and correct aspect ratio
+            screen_data = cube.get_screen_data(cur_win_w, cur_win_h)
 
-            # Render clean Tony Stark holographic scene
+            # Render clean Tony Stark holographic scene with dynamic canvas dimensions
             canvas = renderer.render(
                 screen_data,
                 gesture_info=state,
                 clear_btn_rect=CLEAR_BTN_RECT,
                 is_btn_hovered=mouse_state["is_hovered"],
+                canvas_w=cur_win_w,
+                canvas_h=cur_win_h,
             )
 
             # Composite clean PiP camera in bottom-right corner with skeleton
@@ -203,6 +244,13 @@ def main():
             key = cv2.waitKey(1) & 0xFF
             if key in (ord('q'), 27):
                 break
+            elif key == ord('f'):
+                is_fullscreen = not is_fullscreen
+                if is_fullscreen:
+                    cv2.setWindowProperty(win_name, cv2.WND_PROP_FULLSCREEN, cv2.WINDOW_FULLSCREEN)
+                else:
+                    cv2.setWindowProperty(win_name, cv2.WND_PROP_FULLSCREEN, cv2.WINDOW_NORMAL)
+                    cv2.resizeWindow(win_name, WIN_W, WIN_H)
             elif key == ord('c'):
                 cube.clear()
             elif key == ord('r'):
