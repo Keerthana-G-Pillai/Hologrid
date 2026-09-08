@@ -1,15 +1,17 @@
 """
 main.py
 -------
-Project HoloGrid 3D Builder
-Interactive 3D Voxel Hologram Studio with On-Screen UI & Hand Gesture Controls.
+HoloGrid 3D Studio — 3D Painting & Sculpting Edition.
 
 Features:
-- On-Screen Clickable Buttons: Clear, Undo, Paint Toggle, Zoom -/+, View Presets (ISO, Front, Top, Side), Rotation controls, and Auto-Spin.
-- Zoomed-Out Default View: Clean perspective fitting all 3D blocks comfortably.
-- Air Hand Drawing: Move hand in 3D air to paint blocks in whichever direction you move.
-- Physical Fist-Grab: Turn the whole 3D world by making a fist and moving hand.
-- Mouse Support: Click buttons, drag in 3D viewport to tumble/rotate, scroll to zoom.
+- Continuous 3D Stroke Painting: Pinch index + thumb to start drawing; move index finger
+  freely to sculpt unbroken lines, curves, rings, and geometric figures.
+- Real-Time 3D Paint Preview: Shows an active glowing ghost trail along the user's trajectory.
+- Release to Commit: Opening the pinch commits the complete figure atomically to the hologrid.
+- Zero Gaps: 3D Bresenham / DDA interpolation connects every movement with no disconnected voxels.
+- Whole Palm Rotation: Tumbles the complete 3D structure around its central pivot.
+- Two-Hand Zoom: Spreading or bringing hands together zooms in and out.
+- Minimalist Iron Man CAD UI: Side HUD, clean [CLEAR] button, and camera PiP.
 """
 
 import time
@@ -23,51 +25,17 @@ from hologram_render import HologramRenderer
 WIN_W = 1024
 WIN_H = 720
 
-# Global mouse state
+CLEAR_BTN_RECT = (20, 20, 95, 34)
+
+# Mouse interaction state
 mouse_state = {
     "x": 0,
     "y": 0,
     "is_down": False,
     "drag_start": None,
-    "clicked_btn": None,
-    "hovered_btn": None,
+    "clicked_clear": False,
+    "is_hovered": False,
 }
-
-
-def _get_buttons(paint_enabled, auto_spin):
-    bx = 20
-    bw = 166
-    bw_half = 80
-    bw_gap = 6
-
-    return [
-        # Actions
-        {"id": "clear",        "label": "CLEAR ALL",       "rect": (bx, 82,  bw, 32), "active": False},
-        {"id": "undo",         "label": "UNDO BLOCK",      "rect": (bx, 120, bw, 30), "active": False},
-        {"id": "paint_toggle", "label": f"PAINT: {'ON' if paint_enabled else 'OFF'}",
-                               "rect": (bx, 156, bw, 32), "active": paint_enabled},
-
-        # Zoom
-        {"id": "zoom_out",     "label": "ZOOM -",          "rect": (bx, 206, bw_half, 30), "active": False},
-        {"id": "zoom_in",      "label": "ZOOM +",          "rect": (bx + bw_half + bw_gap, 206, bw_half, 30), "active": False},
-
-        # 3D Presets
-        {"id": "view_iso",     "label": "3D ISO VIEW",     "rect": (bx, 256, bw, 28), "active": False},
-        {"id": "view_front",   "label": "FRONT",           "rect": (bx, 290, bw_half, 28), "active": False},
-        {"id": "view_top",     "label": "TOP",             "rect": (bx + bw_half + bw_gap, 290, bw_half, 28), "active": False},
-        {"id": "view_side",    "label": "SIDE VIEW",       "rect": (bx, 324, bw, 28), "active": False},
-
-        # Nudge Rotation
-        {"id": "rot_left",     "label": "< ROT-L",         "rect": (bx, 372, bw_half, 28), "active": False},
-        {"id": "rot_right",    "label": "ROT-R >",         "rect": (bx + bw_half + bw_gap, 372, bw_half, 28), "active": False},
-        {"id": "tilt_up",      "label": "^ TILT-U",        "rect": (bx, 406, bw_half, 28), "active": False},
-        {"id": "tilt_down",    "label": "v TILT-D",        "rect": (bx + bw_half + bw_gap, 406, bw_half, 28), "active": False},
-
-        # Auto-spin & Reset
-        {"id": "auto_spin",    "label": f"SPIN: {'ON' if auto_spin else 'OFF'}",
-                               "rect": (bx, 454, bw, 30), "active": auto_spin},
-        {"id": "reset_view",   "label": "RESET VIEW",      "rect": (bx, 490, bw, 30), "active": False},
-    ]
 
 
 def _point_in_rect(px, py, rect):
@@ -79,29 +47,19 @@ def _on_mouse(event, x, y, flags, param):
     global mouse_state
     mouse_state["x"] = x
     mouse_state["y"] = y
-
-    buttons = param.get("buttons", [])
-
-    # Check hover
-    hovered = None
-    for btn in buttons:
-        if _point_in_rect(x, y, btn["rect"]):
-            hovered = btn["id"]
-            break
-    mouse_state["hovered_btn"] = hovered
+    mouse_state["is_hovered"] = _point_in_rect(x, y, CLEAR_BTN_RECT)
 
     if event == cv2.EVENT_LBUTTONDOWN:
         mouse_state["is_down"] = True
         mouse_state["drag_start"] = (x, y)
-        if hovered:
-            mouse_state["clicked_btn"] = hovered
+        if mouse_state["is_hovered"]:
+            mouse_state["clicked_clear"] = True
 
     elif event == cv2.EVENT_LBUTTONUP:
         mouse_state["is_down"] = False
         mouse_state["drag_start"] = None
 
     elif event == cv2.EVENT_MOUSEWHEEL:
-        # High-order word indicates scroll direction
         if flags > 0:
             param["cube"].zoom_in()
         else:
@@ -135,30 +93,32 @@ def main():
 
     cam_h, cam_w = first_frame.shape[:2]
 
-    tracker = HandTracker(max_hands=1, detection_confidence=0.32, tracking_confidence=0.32)
-    gestures = GestureProcessor(frame_w=cam_w, frame_h=cam_h, grid_range=(8, 6, 5))
+    # Initialize tracking supporting up to 2 hands (for drawing + two-hand zoom)
+    tracker = HandTracker(max_hands=2, detection_confidence=0.32, tracking_confidence=0.32)
+    gestures = GestureProcessor(frame_w=cam_w, frame_h=cam_h, grid_range=(7, 5, 4))
     cube = CubeEngine(block_size=0.35, grid_step=0.35)
     renderer = HologramRenderer(width=WIN_W, height=WIN_H)
 
-    paint_enabled = True
-    auto_spin = False
-    fps = 0.0
-    prev_time = time.time()
-
-    win_name = "Project HoloGrid 3D Builder"
+    win_name = "HoloGrid 3D Studio"
     cv2.namedWindow(win_name)
 
-    mouse_params = {"buttons": [], "cube": cube}
+    mouse_params = {"cube": cube}
     cv2.setMouseCallback(win_name, _on_mouse, mouse_params)
 
     prev_drag_pos = None
 
     print("\n=======================================================")
-    print("Project HoloGrid 3D Builder running with On-Screen UI!")
-    print(" - On-screen buttons: Clear, Undo, Zoom -/+, Rotate, Spin")
-    print(" - Hand in air: Paint blocks in whichever direction you move")
-    print(" - Closed fist: Grab and turn the whole 3D world")
-    print(" - Mouse: Click buttons, drag 3D view, or scroll to zoom")
+    print("       HOLOGRID BUILDER — FUTURISTIC 3D STUDIO")
+    print("=======================================================")
+    print(" 🤏 INDEX + THUMB PINCH : START PAINTING")
+    print(" ☝ MOVE INDEX FINGER    : Draw continuous 3D block path")
+    print(" 🤏 RELEASE PINCH       : Finish current stroke & commit")
+    print(" 🖐 ONE OPEN PALM       : Slow & smooth 3D hologrid rotation")
+    print(" 👐 TWO OPEN HANDS      : Zoom (Apart -> IN | Together -> OUT)")
+    print(" ✊ CLOSED FIST         : Stop / Cancel active action")
+    print(" NO HAND                : Safe idle")
+    print(" 'c' / [CLEAR]          : Clear structure | 'u': Undo stroke")
+    print(" 'r'                    : Reset view | Mouse Drag: Rotate")
     print("=======================================================\n")
 
     try:
@@ -169,66 +129,16 @@ def main():
 
             frame = cv2.flip(frame, 1)
 
-            # 1. Update on-screen buttons list
-            buttons = _get_buttons(paint_enabled, auto_spin)
-            mouse_params["buttons"] = buttons
+            # Handle clear button click
+            if mouse_state["clicked_clear"]:
+                mouse_state["clicked_clear"] = False
+                cube.clear()
+                print("[Action] Cleared all blocks.")
 
-            # 2. Handle button clicks
-            if mouse_state["clicked_btn"]:
-                cid = mouse_state["clicked_btn"]
-                mouse_state["clicked_btn"] = None
-
-                if cid == "clear":
-                    cube.clear()
-                    print("[UI] Cleared all blocks.")
-                elif cid == "undo":
-                    cube.undo()
-                    print("[UI] Undid last block.")
-                elif cid == "paint_toggle":
-                    paint_enabled = not paint_enabled
-                    print(f"[UI] Paint toggled: {'ON' if paint_enabled else 'OFF'}")
-                elif cid == "zoom_in":
-                    cube.zoom_in()
-                elif cid == "zoom_out":
-                    cube.zoom_out()
-                elif cid == "view_iso":
-                    cube.set_preset_view("iso")
-                    gestures.set_rotation(cube.rot_x, cube.rot_y, cube.rot_z)
-                elif cid == "view_front":
-                    cube.set_preset_view("front")
-                    gestures.set_rotation(cube.rot_x, cube.rot_y, cube.rot_z)
-                elif cid == "view_top":
-                    cube.set_preset_view("top")
-                    gestures.set_rotation(cube.rot_x, cube.rot_y, cube.rot_z)
-                elif cid == "view_side":
-                    cube.set_preset_view("side")
-                    gestures.set_rotation(cube.rot_x, cube.rot_y, cube.rot_z)
-                elif cid == "rot_left":
-                    cube.rotate_nudge(yaw_delta=-18.0)
-                    gestures.set_rotation(cube.rot_x, cube.rot_y, cube.rot_z)
-                elif cid == "rot_right":
-                    cube.rotate_nudge(yaw_delta=18.0)
-                    gestures.set_rotation(cube.rot_x, cube.rot_y, cube.rot_z)
-                elif cid == "tilt_up":
-                    cube.rotate_nudge(pitch_delta=-18.0)
-                    gestures.set_rotation(cube.rot_x, cube.rot_y, cube.rot_z)
-                elif cid == "tilt_down":
-                    cube.rotate_nudge(pitch_delta=18.0)
-                    gestures.set_rotation(cube.rot_x, cube.rot_y, cube.rot_z)
-                elif cid == "auto_spin":
-                    auto_spin = not auto_spin
-                    print(f"[UI] Auto-spin: {'ON' if auto_spin else 'OFF'}")
-                elif cid == "reset_view":
-                    cube.set_preset_view("iso")
-                    cube.scale = 0.80
-                    gestures.reset_view()
-                    auto_spin = False
-                    print("[UI] Reset view.")
-
-            # 3. Handle mouse drag rotation (when dragging outside the button panel)
+            # Handle mouse drag rotation (secondary control)
             if mouse_state["is_down"] and mouse_state["drag_start"]:
                 cur_x, cur_y = mouse_state["x"], mouse_state["y"]
-                if cur_x > 200:  # outside the left control panel
+                if not mouse_state["is_hovered"]:
                     if prev_drag_pos is not None:
                         pdx = cur_x - prev_drag_pos[0]
                         pdy = cur_y - prev_drag_pos[1]
@@ -238,74 +148,58 @@ def main():
             else:
                 prev_drag_pos = None
 
-            # 4. Auto-spin rotation
-            if auto_spin:
-                cube.rotate_nudge(yaw_delta=0.85)
-                gestures.set_rotation(cube.rot_x, cube.rot_y, cube.rot_z)
-
-            # 5. Hand tracking
+            # Process hand tracking
             result = tracker.process(frame)
-            hand_present = result["landmarks"] is not None
+            landmarks = result["landmarks"]
+            norm_landmarks = result.get("norm_landmarks")
+            all_hands = result.get("all_hands")
 
-            if hand_present:
-                state = gestures.update(result["landmarks"])
-                gx, gy, gz = state["grid_pos"]
-                cube.set_cursor(gx, gy, gz)
-
-                if state["grab"]:
-                    mode_str = "ROTATING 3D VIEW (Fist Grab)"
-                    status_str = f"Rotating scene | Hand at ({gx:+d}, {gy:+d}, {gz:+d})"
-                    cube.set_transform(state["rot_x"], state["rot_y"], state["rot_z"])
-                else:
-                    if paint_enabled:
-                        cube.add_block(gx, gy, gz)
-                        mode_str = "3D AIR PAINTING"
-                        status_str = f"Painting voxel at ({gx:+d}, {gy:+d}, {gz:+d}) | Fist to rotate"
-                    else:
-                        mode_str = "CURSOR NAVIGATION (Paused)"
-                        status_str = f"Cursor at ({gx:+d}, {gy:+d}, {gz:+d}) | Click [PAINT] to draw"
+            if landmarks is not None:
+                state = gestures.update(landmarks, norm_landmarks, all_hands)
             else:
                 state = gestures.hold()
-                mode_str = "NO HAND DETECTED"
-                status_str = "Show hand or use on-screen buttons to build & rotate"
 
-            # 6. Project 3D blocks & cursor to 2D screen coordinates
+            # Update 3D cursor position
+            gx, gy, gz = state["grid_pos"]
+            cube.set_cursor(gx, gy, gz)
+
+            # Sync in-progress preview stroke for live rendering
+            cube.set_active_stroke(state.get("active_stroke", []))
+
+            # Commit stroke if completed
+            commit_cells = state.get("commit_stroke", [])
+            if commit_cells:
+                new_blocks = cube.commit_stroke(commit_cells)
+                print(f"[Stroke Committed] Added {new_blocks} blocks. Total: {len(cube.blocks)} across {len(cube.stroke_history)} strokes.")
+
+            # Apply 3D scene rotation when Open Palm is active
+            if state["is_rotating"]:
+                cube.set_transform(state["rot_x"], state["rot_y"], state["rot_z"])
+
+            # Sync two-hand zoom scale
+            cube.scale = state["scale"]
+
+            # Project 3D geometry (ground grid, blocks, active stroke preview, cursor)
             screen_data = cube.get_screen_data(WIN_W, WIN_H)
 
-            # 7. Render hologram scene with on-screen buttons
+            # Render clean Tony Stark holographic scene
             canvas = renderer.render(
                 screen_data,
-                status_text=status_str,
-                mode_text=mode_str,
-                hand_detected=hand_present,
-                buttons=buttons,
-                hovered_btn=mouse_state["hovered_btn"],
+                gesture_info=state,
+                clear_btn_rect=CLEAR_BTN_RECT,
+                is_btn_hovered=mouse_state["is_hovered"],
             )
 
-            # 8. Composite PiP camera with skeleton tracking overlay
+            # Composite clean PiP camera in bottom-right corner with skeleton
             canvas = renderer.add_pip(
                 canvas,
                 frame,
-                hand_landmarks=result["landmarks"],
-                hand_detected=hand_present,
+                hand_landmarks=landmarks,
+                gesture_info=state,
             )
-
-            # 9. FPS and Header HUD
-            now = time.time()
-            dt = now - prev_time
-            prev_time = now
-            if dt > 0:
-                inst = 1.0 / dt
-                fps = inst if fps == 0 else 0.9 * fps + 0.1 * inst
-
-            cv2.putText(canvas, "HOLOGRID 3D BUILDER", (210, 32),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.72, (255, 255, 120), 2, cv2.LINE_AA)
-            cv2.putText(canvas, f"FPS: {fps:.1f} | Zoom: {cube.scale:.2f}x | Click on-screen buttons or drag mouse", (210, 56),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.46, (120, 240, 255), 1, cv2.LINE_AA)
 
             cv2.imshow(win_name, canvas)
 
-            # 10. Key shortcuts (backup alongside on-screen buttons)
             key = cv2.waitKey(1) & 0xFF
             if key in (ord('q'), 27):
                 break
@@ -313,13 +207,9 @@ def main():
                 cube.clear()
             elif key == ord('r'):
                 cube.set_preset_view("iso")
-                cube.scale = 0.80
                 gestures.reset_view()
-                auto_spin = False
             elif key == ord('u'):
-                cube.undo()
-            elif key == ord(' '):
-                paint_enabled = not paint_enabled
+                cube.undo_stroke()
             elif key in (ord('+'), ord('=')):
                 cube.zoom_in()
             elif key in (ord('-'), ord('_')):
@@ -333,5 +223,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
-

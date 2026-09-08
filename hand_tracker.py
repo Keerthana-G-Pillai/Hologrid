@@ -150,6 +150,13 @@ class HandTracker:
         output["handedness"] = handedness_label
         output["hand_size"] = max(hand_size, 10.0)
 
+        # All detected hands for multi-hand gestures (e.g. two-hand zoom)
+        all_hands_pts = []
+        for h_lm in results.hand_landmarks:
+            all_hands_pts.append([(lm.x * w, lm.y * h) for lm in h_lm])
+        output["all_hands"] = all_hands_pts
+        output["num_hands"] = len(all_hands_pts)
+
         return output
 
     @staticmethod

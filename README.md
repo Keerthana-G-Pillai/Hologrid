@@ -1,50 +1,53 @@
-# HoloGrid 3D Builder — Hand-Tracked Holographic Voxel Studio
+# HoloGrid 3D Studio — Tony Stark / Iron Man Holographic Builder
 
-An interactive webcam-powered 3D holographic block builder rendered entirely with OpenCV and NumPy (no heavy OpenGL/3D game engines). Track your hand movements in real-time with MediaPipe to paint 3D voxel structures in mid-air and rotate the entire 3D world with physical hand gestures!
+An uncluttered, interactive 3D holographic voxel workshop inspired by Tony Stark's CAD interface, rendered entirely in Python using OpenCV and NumPy with MediaPipe hand tracking.
 
 ---
 
-## What's New & Features
+## 3D Continuous Painting Controls
 
-1. **Air Drawing in Any Direction (X, Y, Z)**:
-   - Move your hand naturally in the air to paint glowing sci-fi blocks in whichever direction your hand travels.
-   - Depth (Z-axis) dynamically responds to moving your hand closer or further from the camera.
+### 1. 🤏 Pinch (Index + Thumb) to Start Painting
+- Bring your **Index Fingertip and Thumb Tip together**.
+- The system enters **`PAINTING`** mode and locks the stroke.
+- The index finger becomes your continuous 3D brush.
 
-2. **360° 3D View Rotation**:
-   - Close your hand into a **Fist** to grab and turn the entire 3D scene in real-time.
-   - Release your fist to lock the angle and continue building from that new perspective.
+### 2. ☝ Move Index Finger: Sculpt Unbroken 3D Figures
+- Simply move your index finger in 3D space.
+- The system connects every movement using **3D DDA interpolation with ZERO GAPS**.
+- Creates straight beams, smooth curves, circles, rings, and complex 3D geometry.
+- A real-time **ghost preview trail** renders along the entire path as you draw.
 
-3. **Compact Modular Block Size**:
-   - Blocks have been tuned to a sleek, modular size (`0.35` units) so you can sculpt rich 3D structures without giant blocks cluttering the screen.
+### 3. 💨 Release Pinch: Commit Complete Stroke
+- Open your fingers to release the pinch.
+- The entire path is **atomically committed** as glowing cyber-cyan blocks.
+- Moving the index finger after release does **NOT** modify previous strokes.
+- Pinch again whenever you want to begin a fresh new stroke.
 
-4. **Enhanced Hand Detection & Live Skeleton PiP**:
-   - Uses MediaPipe Tasks `RunningMode.IMAGE` with sensitive detection thresholds (`0.32`) to ensure your hand is picked up immediately regardless of lighting or handedness.
-   - The top-right Picture-in-Picture webcam feed displays your real-time 21-point hand skeleton in neon green so you can immediately see tracking status.
+### 4. 🖐 Whole Open Palm: Rotate 3D Scene
+- Show an **Open Palm** (3+ fingers extended) to tumble the entire 3D structure around its center pivot.
 
-## On-Screen Cyber Control Panel
+### 5. 👐 Two Hands: Zoom In / Out
+- Present **both hands** and separate them to zoom in, or bring them together to zoom out.
 
-All features can now be controlled directly on the screen by clicking with your mouse (or using hand gestures / hotkeys):
+### 6. ✊ Closed Fist: Cancel / Standby
+- Making a fist during drawing immediately **cancels** the current in-progress stroke.
 
-### 1. Actions
-- **`[CLEAR ALL]`**: Clears all blocks back to the center anchor.
-- **`[UNDO BLOCK]`**: Undoes the last placed voxel.
-- **`[PAINT: ON/OFF]`**: Toggles active air painting on or off (pause painting to navigate the cursor freely).
+### 7. Keyboard Shortcuts
+- **`u`**: Undo last complete stroke.
+- **`c`**: Clear all blocks.
+- **`r`**: Reset view to isometric preset.
+- **Mouse Drag**: Secondary rotation | **Scroll**: Zoom.
 
-### 2. View Zoom
-- **`[ZOOM -]`** / **`[ZOOM +]`**: Smoothly zooms the 3D scene in or out. (You can also scroll the mouse wheel or pinch fingers).
-- **Zoomed-Out Default View**: The camera distance and initial scale have been zoomed out so your 3D voxel creations fit comfortably in the frame.
+---
 
-### 3. 3D View Angles & Presets
-- **`[3D ISO VIEW]`**: Isometric 3D angle.
-- **`[FRONT]`**: Direct front elevation view.
-- **`[TOP]`**: Direct bird's-eye top-down plan view.
-- **`[SIDE VIEW]`**: Side profile view.
+## Clean & Minimal Interface
 
-### 4. Rotation Controls
-- **`[< ROT-L]`** / **`[ROT-R >]`**: Step rotate view left/right.
-- **`[^ TILT-U]`** / **`[v TILT-D]`**: Step tilt view up/down.
-- **`[SPIN: ON/OFF]`**: Automatic continuous rotation so you can view your creation hands-free.
-- **`[RESET VIEW]`**: Snaps orientation and zoom back to default.
-- **Mouse Drag in 3D Viewport**: Click and drag anywhere in the 3D area with the mouse to freely tumble and inspect your blocks from any angle!
+- **Pure 3D Viewport**: All clumsy sidebar buttons have been removed for an authentic, clean holographic space.
+- **3D Perspective Ground Grid**: Horizontal CAD ground plane that rotates with the scene for spatial orientation.
+- **Top-Left `[CLEAR]` Button**: Single clean button to reset blocks (or press `c` on the keyboard).
+- **Bottom-Right Camera Inset**: Minimal PiP webcam feed with live hand skeleton overlay.
+- **Mouse Controls**: Click & drag in the 3D space to rotate; scroll to zoom in/out.
+
+
 
 
