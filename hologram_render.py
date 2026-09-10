@@ -340,8 +340,10 @@ class HologramRenderer:
             badge_border = (160, 140, 50)    # calm blue-grey
             badge_fill = (22, 18, 12)
 
-        # Render prominent badge in top right (expanded for direction feedback)
-        bx, by, bw, bh = self.width - 320, 14, 300, 56
+        # Render prominent badge in top right
+        bw = 360
+        bx = max(10, self.width - bw - 20)
+        by, bh = 14, 54
         bg_card = canvas.copy()
         cv2.rectangle(bg_card, (bx, by), (bx + bw, by + bh), badge_fill, -1)
         cv2.addWeighted(bg_card, 0.72, canvas, 0.28, 0, dst=canvas)
@@ -350,16 +352,39 @@ class HologramRenderer:
         # Text inside badge
         header_text = f"STATE: {mode_badge}"
         cv2.putText(canvas, header_text, (bx + 14, by + 20),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.50, (255, 255, 255), 1, cv2.LINE_AA)
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.48, (255, 255, 255), 1, cv2.LINE_AA)
         
         detail_text = f"{action_badge}"
         if direction_badge:
             detail_text += f" | {direction_badge}"
-        if len(detail_text) > 34:
-            detail_text = detail_text[:34]
+        if len(detail_text) > 46:
+            detail_text = detail_text[:46]
 
-        cv2.putText(canvas, detail_text, (bx + 14, by + 42),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.38, badge_border, 1, cv2.LINE_AA)
+        cv2.putText(canvas, detail_text, (bx + 14, by + 40),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.35, badge_border, 1, cv2.LINE_AA)
+
+        # Dedicated Debug Overlay Card (Requirement 7)
+        # Shows SCREEN (X, Y), GRID (X, Y, Z), and MOVEMENT (LEFT/RIGHT/UP/DOWN)
+        screen_pos = gesture_info.get("screen_pos", (0, 0)) if gesture_info else (0, 0)
+        grid_pos = gesture_info.get("grid_pos", (0, 0, 0)) if gesture_info else (0, 0, 0)
+        movement_str = gesture_info.get("movement_str", "STATIONARY") if gesture_info else "STATIONARY"
+
+        db_w = 320
+        db_x = max(10, self.width - db_w - 20)
+        db_y = by + bh + 8
+        db_h = 72
+
+        dbg_card = canvas.copy()
+        cv2.rectangle(dbg_card, (db_x, db_y), (db_x + db_w, db_y + db_h), (20, 16, 10), -1)
+        cv2.addWeighted(dbg_card, 0.75, canvas, 0.25, 0, dst=canvas)
+        cv2.rectangle(canvas, (db_x, db_y), (db_x + db_w, db_y + db_h), (75, 60, 30), 1, cv2.LINE_AA)
+
+        cv2.putText(canvas, f"SCREEN : X: {screen_pos[0]:3d}  Y: {screen_pos[1]:3d}", (db_x + 12, db_y + 20),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.38, (220, 240, 255), 1, cv2.LINE_AA)
+        cv2.putText(canvas, f"GRID   : X: {grid_pos[0]:2d}  Y: {grid_pos[1]:2d}  Z: {grid_pos[2]:2d} (FIXED 2D)", (db_x + 12, db_y + 42),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.38, (0, 255, 200), 1, cv2.LINE_AA)
+        cv2.putText(canvas, f"MOVE   : {movement_str}", (db_x + 12, db_y + 63),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.40, (255, 220, 30), 1, cv2.LINE_AA)
 
     def render(self, screen_data, gesture_info=None, clear_btn_rect=(20, 20, 95, 34),
                is_btn_hovered=False, canvas_w=None, canvas_h=None):

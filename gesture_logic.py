@@ -66,188 +66,300 @@ def interpolate_3d_line(p0, p1):
 
 class GeometricStrokeBuilder:
     """
-    Segment-Based Sticky-Axis 3D Geometric Drawing Engine.
+    Monotonic Segment-Based 3D Geometric Drawing Engine for Hologrid Builder.
     
     Principles:
-    1. INTENT WINDOW:
-       - Collects initial fingertip samples at start of stroke/segment.
-       - Locks dominant direction: 'H' (Horizontal, lock Y), 'V' (Vertical, lock X), or 'CURVE'.
-    2. STICKY AXIS LOCK:
-       - In 'H': Y is STRICTLY locked to the initial row. MediaPipe vertical jitter is 100% ignored.
-       - In 'V': X is STRICTLY locked to the initial column. MediaPipe horizontal jitter is 100% ignored.
-       - Depth Z is locked to the stroke plane.
-    3. SEGMENT-BASED CORNER DETECTION:
-       - Sustained perpendicular motion (> DIRECTION_CHANGE_THRESHOLD for CORNER_SUSTAIN_FRAMES)
-         ends the previous segment cleanly at the corner block and starts the next perpendicular segment.
-       - Creates razor-sharp 90° right angles (no rounded corners, no diagonal transitions).
-    4. PERFECT VOXEL RECTANGLES / SQUARES:
-       - A 4-sided loop snaps closed when returning within 1 cell of the start point.
-       - Exactly one block thick with zero gaps, zero clustering, and zero zigzags.
+    1. LOCK THE STROKE DIRECTION ONCE:
+       - Collects initial fingertip samples (6 frames) before locking direction.
+       - Determines intended direction from overall displacement: 'RIGHT', 'LEFT', 'DOWN', 'UP', or 'CURVE'.
+       - Never recalculates direction from individual frame-to-frame micro-deltas.
+    2. NEVER LET SMALL JITTER REVERSE DIRECTION:
+       - For 'RIGHT': progress = max(previous_progress, cur_gx). Backward jitter ignored completely.
+       - For 'LEFT':  progress = min(previous_progress, cur_gx). Forward jitter ignored completely.
+       - For 'DOWN':  progress = min(previous_progress, cur_gy). Upward jitter ignored completely.
+       - For 'UP':    progress = max(previous_progress, cur_gy). Downward jitter ignored completely.
+    3. STRICT AXIS LOCK:
+       - Horizontal lines strictly lock Y to anchor cell. All blocks stay on the exact same row.
+       - Vertical lines strictly lock X to anchor cell. All blocks stay on the exact same column.
+    4. CONFIRMED CORNER TURNS (SHARP 90° CORNERS):
+       - Only switches direction when perpendicular movement exceeds DIRECTION_CHANGE_THRESHOLD
+         and is sustained over CORNER_SUSTAIN_FRAMES.
+       - Finalizes current segment cleanly at corner block, locks new axis, and continues.
+    5. LOOP CLOSURE:
+       - Snaps closed loop cleanly when returning within 1 cell of the start point.
     """
     def __init__(self):
-        self.DIRECTION_CHANGE_THRESHOLD = 0.85  # grid units required to turn a corner
-        self.CORNER_SUSTAIN_FRAMES = 2         # consecutive frames of perpendicular movement required
-        self.INTENT_MIN_DIST = 0.35            # movement required to decide initial segment direction
+        self.INIT_SAMPLE_COUNT = 6
+        self.INTENT_MIN_DISP = 0.45             # grid units to lock initial direction
+        self.DIRECTION_CHANGE_THRESHOLD = 0.85  # grid units perpendicular to turn corner
+        self.CORNER_SUSTAIN_FRAMES = 3          # consecutive frames of perpendicular movement required
         self.reset()
 
     def reset(self):
-        self.all_completed_segments = []       # list of (seg_start_cell, seg_end_cell)
+        self.stroke_cells = []
+        self.stroke_set = set()
         self.start_cell = None
         self.anchor_cell = None
         self.anchor_float = None
-        self.locked_axis = None                # 'H', 'V', 'CURVE', or None
-        self.locked_coord = None               # locked Y for 'H', locked X for 'V'
+
+        # Initialization window
+        self.init_samples = []
+        self.is_direction_locked = False
+
+        # Locked direction: 'RIGHT', 'LEFT', 'UP', 'DOWN', 'CURVE'
+        self.stroke_direction = None
+        self.locked_axis = None                 # 'H', 'V', 'CURVE'
+        self.locked_coord = None                # locked Y for H, locked X for V
+        self.progress = None                    # monotonic progress along active direction
         self.depth_z = 0
-        self.max_reach = 0
+
+        # Corner detection
         self.corner_sustain_count = 0
+        self.debug_status = 'IDLE'
         self.active_cell = None
-        self.stroke_cells = []
-        self.stroke_set = set()
         self.last_cell = None
 
     def start(self, float_pos):
         fx, fy, fz = float(float_pos[0]), float(float_pos[1]), float(float_pos[2])
-        gx, gy, gz = int(round(fx)), int(round(fy)), int(round(fz))
-        start_cell = (gx, gy, gz)
-        self.all_completed_segments = []
+        start_cell = (int(round(fx)), int(round(fy)), int(round(fz)))
+        self.stroke_cells = [start_cell]
+        self.stroke_set = {start_cell}
         self.start_cell = start_cell
         self.anchor_cell = start_cell
         self.anchor_float = (fx, fy, fz)
+        self.init_samples = [(fx, fy)]
+        self.is_direction_locked = False
+        self.stroke_direction = None
         self.locked_axis = None
         self.locked_coord = None
-        self.depth_z = gz
-        self.max_reach = gx
+        self.progress = None
+        self.depth_z = start_cell[2]
         self.corner_sustain_count = 0
         self.active_cell = start_cell
         self.last_cell = start_cell
-        self.stroke_cells = [start_cell]
-        self.stroke_set = {start_cell}
+        self.debug_status = 'PAINT LOCKED | INIT WINDOW'
 
     def add_point(self, float_pos):
+        fx, fy, fz = float(float_pos[0]), float(float_pos[1]), float(float_pos[2])
+
         if self.anchor_cell is None:
             self.start(float_pos)
-            return self.active_cell
+            return self.stroke_cells[-1]
 
-        fx, fy, fz = float(float_pos[0]), float(float_pos[1]), float(float_pos[2])
-        ax, ay, az = self.anchor_float
+        # 1. INITIALIZATION WINDOW: Collect samples before locking direction once
+        if not self.is_direction_locked:
+            self.init_samples.append((fx, fy))
+            start_fx, start_fy = self.init_samples[0]
+            dx = fx - start_fx
+            dy = fy - start_fy
+            dist = math.hypot(dx, dy)
 
-        dx = fx - ax
-        dy = fy - ay
-        dist = math.hypot(dx, dy)
-
-        # 1. Intent Window: determine initial axis if not yet set
-        if self.locked_axis is None:
-            if dist < self.INTENT_MIN_DIST:
+            # Keep collecting samples until initialization window is filled
+            if len(self.init_samples) < self.INIT_SAMPLE_COUNT:
+                self.debug_status = f'INIT: {len(self.init_samples)}/{self.INIT_SAMPLE_COUNT} SAMPLES'
                 return self.anchor_cell
-            if abs(dx) >= 1.30 * abs(dy):
+
+            # Require intentional movement displacement before locking direction
+            if dist < self.INTENT_MIN_DISP:
+                self.debug_status = 'PAINT LOCKED | AWAITING INTENT'
+                return self.anchor_cell
+
+            # Lock initial direction ONCE based on overall accumulated displacement
+            self.is_direction_locked = True
+            if abs(dx) >= 1.25 * abs(dy):
                 self.locked_axis = 'H'
-                self.locked_coord = self.anchor_cell[1] # lock Y row
-                self.max_reach = self.anchor_cell[0]
-            elif abs(dy) >= 1.30 * abs(dx):
+                self.locked_coord = self.anchor_cell[1] # lock Y to anchor row
+                if dx > 0:
+                    self.stroke_direction = 'RIGHT'
+                    self.progress = self.anchor_cell[0]
+                else:
+                    self.stroke_direction = 'LEFT'
+                    self.progress = self.anchor_cell[0]
+            elif abs(dy) >= 1.25 * abs(dx):
                 self.locked_axis = 'V'
-                self.locked_coord = self.anchor_cell[0] # lock X col
-                self.max_reach = self.anchor_cell[1]
+                self.locked_coord = self.anchor_cell[0] # lock X to anchor column
+                if dy < 0: # Screen DOWN (negative Y)
+                    self.stroke_direction = 'DOWN'
+                    self.progress = self.anchor_cell[1]
+                else:      # Screen UP (positive Y)
+                    self.stroke_direction = 'UP'
+                    self.progress = self.anchor_cell[1]
             else:
                 self.locked_axis = 'CURVE'
+                self.stroke_direction = 'CURVE'
+                self.progress = None
 
-        # 2. Process according to active locked axis
-        if self.locked_axis == 'H':
+            self.debug_status = f'PAINT LOCKED | Segment: {self.locked_axis} | Direction: {self.stroke_direction} | Progress: {self.progress}'
+
+        # 2. MONOTONIC ADVANCEMENT ACCORDING TO LOCKED DIRECTION
+        if self.stroke_direction == 'RIGHT':
             locked_y = self.locked_coord
             cur_gx = int(round(fx))
             delta_y = fy - locked_y
 
-            # Check for deliberate corner turn (sustained vertical intent)
+            # Check for deliberate corner turn (sustained vertical motion across 3 frames)
             if abs(delta_y) >= self.DIRECTION_CHANGE_THRESHOLD:
                 self.corner_sustain_count += 1
                 if self.corner_sustain_count >= self.CORNER_SUSTAIN_FRAMES:
-                    # Finalize current horizontal segment at corner!
-                    corner_x = self.max_reach
-                    corner_cell = (corner_x, locked_y, self.depth_z)
-                    self.all_completed_segments.append((self.anchor_cell, corner_cell))
-
-                    # Start new vertical segment at corner_cell
-                    self.anchor_cell = corner_cell
-                    self.anchor_float = (float(corner_x), float(locked_y), float(self.depth_z))
-                    self.locked_axis = 'V'
-                    self.locked_coord = corner_x # lock X to corner_x
-                    self.max_reach = corner_cell[1]
-                    self.corner_sustain_count = 0
+                    corner_cell = (self.progress, locked_y, self.depth_z)
+                    new_dir = 'DOWN' if delta_y < 0 else 'UP'
+                    self._start_new_segment(corner_cell, new_dir)
                     return self.add_point(float_pos)
             else:
                 self.corner_sustain_count = 0
-                reach_dir = 1 if (cur_gx >= self.anchor_cell[0]) else -1
-                if reach_dir == 1 and cur_gx > self.max_reach:
-                    self.max_reach = cur_gx
-                elif reach_dir == -1 and cur_gx < self.max_reach:
-                    self.max_reach = cur_gx
 
-            active_cell = (cur_gx, locked_y, self.depth_z)
+            # Monotonically advance forward along RIGHT (+X)
+            # NEVER reverse direction; backward tracking noise is completely ignored
+            if cur_gx > self.progress:
+                for x in range(self.progress + 1, cur_gx + 1):
+                    c = (x, locked_y, self.depth_z)
+                    if c not in self.stroke_set:
+                        self.stroke_set.add(c)
+                        self.stroke_cells.append(c)
+                self.progress = cur_gx
 
-        elif self.locked_axis == 'V':
+            self.active_cell = (self.progress, locked_y, self.depth_z)
+            self.last_cell = self.active_cell
+            self.debug_status = f'PAINT LOCKED | Segment: HORIZONTAL | Direction: RIGHT | Progress: X={self.progress}'
+            return self.active_cell
+
+        elif self.stroke_direction == 'LEFT':
+            locked_y = self.locked_coord
+            cur_gx = int(round(fx))
+            delta_y = fy - locked_y
+
+            # Check for deliberate corner turn
+            if abs(delta_y) >= self.DIRECTION_CHANGE_THRESHOLD:
+                self.corner_sustain_count += 1
+                if self.corner_sustain_count >= self.CORNER_SUSTAIN_FRAMES:
+                    corner_cell = (self.progress, locked_y, self.depth_z)
+                    new_dir = 'DOWN' if delta_y < 0 else 'UP'
+                    self._start_new_segment(corner_cell, new_dir)
+                    return self.add_point(float_pos)
+            else:
+                self.corner_sustain_count = 0
+
+            # Monotonically advance forward along LEFT (-X)
+            # NEVER reverse direction; forward tracking noise is completely ignored
+            if cur_gx < self.progress:
+                for x in range(self.progress - 1, cur_gx - 1, -1):
+                    c = (x, locked_y, self.depth_z)
+                    if c not in self.stroke_set:
+                        self.stroke_set.add(c)
+                        self.stroke_cells.append(c)
+                self.progress = cur_gx
+
+            self.active_cell = (self.progress, locked_y, self.depth_z)
+            self.last_cell = self.active_cell
+            self.debug_status = f'PAINT LOCKED | Segment: HORIZONTAL | Direction: LEFT | Progress: X={self.progress}'
+            return self.active_cell
+
+        elif self.stroke_direction == 'DOWN':
             locked_x = self.locked_coord
             cur_gy = int(round(fy))
             delta_x = fx - locked_x
 
-            # Check for deliberate corner turn (sustained horizontal intent)
+            # Check for deliberate corner turn (sustained horizontal motion)
             if abs(delta_x) >= self.DIRECTION_CHANGE_THRESHOLD:
                 self.corner_sustain_count += 1
                 if self.corner_sustain_count >= self.CORNER_SUSTAIN_FRAMES:
-                    # Finalize current vertical segment at corner!
-                    corner_y = self.max_reach
-                    corner_cell = (locked_x, corner_y, self.depth_z)
-                    self.all_completed_segments.append((self.anchor_cell, corner_cell))
-
-                    # Start new horizontal segment at corner_cell
-                    self.anchor_cell = corner_cell
-                    self.anchor_float = (float(locked_x), float(corner_y), float(self.depth_z))
-                    self.locked_axis = 'H'
-                    self.locked_coord = corner_y # lock Y to corner_y
-                    self.max_reach = corner_cell[0]
-                    self.corner_sustain_count = 0
+                    corner_cell = (locked_x, self.progress, self.depth_z)
+                    new_dir = 'RIGHT' if delta_x > 0 else 'LEFT'
+                    self._start_new_segment(corner_cell, new_dir)
                     return self.add_point(float_pos)
             else:
                 self.corner_sustain_count = 0
-                reach_dir = 1 if (cur_gy >= self.anchor_cell[1]) else -1
-                if reach_dir == 1 and cur_gy > self.max_reach:
-                    self.max_reach = cur_gy
-                elif reach_dir == -1 and cur_gy < self.max_reach:
-                    self.max_reach = cur_gy
 
-            active_cell = (locked_x, cur_gy, self.depth_z)
+            # Monotonically advance forward along DOWN (-Y in world space)
+            # NEVER reverse direction; upward tracking noise is completely ignored
+            if cur_gy < self.progress:
+                for y in range(self.progress - 1, cur_gy - 1, -1):
+                    c = (locked_x, y, self.depth_z)
+                    if c not in self.stroke_set:
+                        self.stroke_set.add(c)
+                        self.stroke_cells.append(c)
+                self.progress = cur_gy
+
+            self.active_cell = (locked_x, self.progress, self.depth_z)
+            self.last_cell = self.active_cell
+            self.debug_status = f'PAINT LOCKED | Segment: VERTICAL | Direction: DOWN | Progress: Y={self.progress}'
+            return self.active_cell
+
+        elif self.stroke_direction == 'UP':
+            locked_x = self.locked_coord
+            cur_gy = int(round(fy))
+            delta_x = fx - locked_x
+
+            # Check for deliberate corner turn (sustained horizontal motion)
+            if abs(delta_x) >= self.DIRECTION_CHANGE_THRESHOLD:
+                self.corner_sustain_count += 1
+                if self.corner_sustain_count >= self.CORNER_SUSTAIN_FRAMES:
+                    corner_cell = (locked_x, self.progress, self.depth_z)
+                    new_dir = 'RIGHT' if delta_x > 0 else 'LEFT'
+                    self._start_new_segment(corner_cell, new_dir)
+                    return self.add_point(float_pos)
+            else:
+                self.corner_sustain_count = 0
+
+            # Monotonically advance forward along UP (+Y in world space)
+            # NEVER reverse direction; downward tracking noise is completely ignored
+            if cur_gy > self.progress:
+                for y in range(self.progress + 1, cur_gy + 1):
+                    c = (locked_x, y, self.depth_z)
+                    if c not in self.stroke_set:
+                        self.stroke_set.add(c)
+                        self.stroke_cells.append(c)
+                self.progress = cur_gy
+
+            self.active_cell = (locked_x, self.progress, self.depth_z)
+            self.last_cell = self.active_cell
+            self.debug_status = f'PAINT LOCKED | Segment: VERTICAL | Direction: UP | Progress: Y={self.progress}'
+            return self.active_cell
 
         else:
-            # CURVE mode: follows smoothed continuous path
+            # CURVE mode: smooth freehand path with 3D DDA interpolation
             cur_gx = int(round(fx))
             cur_gy = int(round(fy))
-            active_cell = (cur_gx, cur_gy, self.depth_z)
+            target_cell = (cur_gx, cur_gy, self.depth_z)
+            if target_cell != self.last_cell and self.last_cell is not None:
+                seg = interpolate_3d_line(self.last_cell, target_cell)
+                for c in seg:
+                    if c not in self.stroke_set:
+                        self.stroke_set.add(c)
+                        self.stroke_cells.append(c)
+                self.last_cell = target_cell
 
-        # Snap closed loop if near start point after drawing at least 3 completed segments
-        if len(self.all_completed_segments) >= 3 and self.start_cell is not None:
-            d_start = max(abs(active_cell[0] - self.start_cell[0]),
-                          abs(active_cell[1] - self.start_cell[1]))
-            if d_start <= 1:
-                active_cell = self.start_cell
+            self.active_cell = target_cell
+            self.debug_status = f'PAINT LOCKED | Segment: CURVE | Blocks: {len(self.stroke_cells)}'
+            return self.active_cell
 
-        self.active_cell = active_cell
-        self.last_cell = active_cell
+    def _start_new_segment(self, corner_cell, new_dir):
+        self.anchor_cell = corner_cell
+        self.anchor_float = (float(corner_cell[0]), float(corner_cell[1]), float(corner_cell[2]))
+        self.stroke_direction = new_dir
+        self.corner_sustain_count = 0
 
-        # Build full deterministic stroke path from all completed segments + active segment
-        cells = []
-        seen = set()
-        for (seg_p0, seg_p1) in self.all_completed_segments:
-            for c in interpolate_3d_line(seg_p0, seg_p1):
-                if c not in seen:
-                    seen.add(c)
-                    cells.append(c)
+        # Snap closed loop if returning near start point after drawing at least 8 blocks
+        if len(self.stroke_cells) >= 8 and self.start_cell is not None:
+            dist_to_start = max(abs(corner_cell[0] - self.start_cell[0]),
+                                abs(corner_cell[1] - self.start_cell[1]))
+            if dist_to_start <= 1:
+                seg = interpolate_3d_line(corner_cell, self.start_cell)
+                for c in seg:
+                    if c not in self.stroke_set:
+                        self.stroke_set.add(c)
+                        self.stroke_cells.append(c)
 
-        for c in interpolate_3d_line(self.anchor_cell, self.active_cell):
-            if c not in seen:
-                seen.add(c)
-                cells.append(c)
+        if new_dir in ('RIGHT', 'LEFT'):
+            self.locked_axis = 'H'
+            self.locked_coord = corner_cell[1]
+            self.progress = corner_cell[0]
+        else:
+            self.locked_axis = 'V'
+            self.locked_coord = corner_cell[0]
+            self.progress = corner_cell[1]
 
-        self.stroke_cells = cells
-        self.stroke_set = seen
-        return active_cell
+        self.debug_status = f'NEW SEGMENT: {new_dir}'
 
 
 class EMA:
@@ -361,6 +473,7 @@ class GestureProcessor:
         # Directional feedback strings
         self.rotation_dir_str = ""
         self.zoom_dir_str = ""
+        self.movement_str = "STATIONARY"
 
         # Last output state cache
         self.last_state = {
@@ -370,6 +483,8 @@ class GestureProcessor:
             "sub_badge": "STOPPED",
             "direction_badge": "",
             "grid_pos": (0, 0, 0),
+            "screen_pos": (0, 0),
+            "movement_str": "STATIONARY",
             "rot_x": self.rot_x,
             "rot_y": self.rot_y,
             "rot_z": self.rot_z,
@@ -637,44 +752,40 @@ class GestureProcessor:
         self.state = target_state
 
         # -------------------------------------------------------------
-        # STEP 4: 3D GRID COORDINATE MAPPING (CURSOR)
+        # STEP 4: 2D SCREEN -> 3D HOLOGRID PLANE COORDINATE MAPPING
         # -------------------------------------------------------------
+        # Fixed 2D Drawing Plane: GRID Z is ALWAYS CONSTANT (0).
+        # Screen X (Horizontal: Left <-> Right) -> GRID X
+        # Screen Y (Vertical: Down <-> Up)     -> GRID Y
+        # Camera visual mirror and screen tracking:
+        # Moving Right -> Screen X increases -> Grid X increases
+        # Moving Left  -> Screen X decreases -> Grid X decreases
+        # Moving Up    -> Screen Y decreases -> Grid Y increases
+        # Moving Down  -> Screen Y increases -> Grid Y decreases
+        screen_x = int(index_tip[0])
+        screen_y = int(index_tip[1])
+
         view_x = (index_tip[0] - self.frame_w * 0.5) / (self.frame_w * 0.38)
         view_y = -(index_tip[1] - self.frame_h * 0.5) / (self.frame_h * 0.38)
         view_x = max(-1.25, min(1.25, view_x))
         view_y = max(-1.25, min(1.25, view_y))
 
-        view_z = (size - self.ref_hand_size) / 45.0
-        view_z = max(-1.25, min(1.25, view_z))
+        smooth_gx = self.ema_cur_x.update(view_x * self.max_gx)
+        smooth_gy = self.ema_cur_y.update(view_y * self.max_gy)
 
-        target_cam = np.array([view_x * self.max_gx,
-                               view_y * self.max_gy,
-                               view_z * self.max_gz], dtype=np.float64)
-
-        if camera_r is not None:
-            rot_mat = camera_r
-        else:
-            rot_mat = self.get_rotation_matrix()
-        target_world = rot_mat.T @ target_cam
-
-        smooth_wx = self.ema_cur_x.update(target_world[0])
-        smooth_wy = self.ema_cur_y.update(target_world[1])
-        smooth_wz = self.ema_cur_z.update(target_world[2])
-
-        raw_gx = int(round(smooth_wx))
-        raw_gy = int(round(smooth_wy))
-        raw_gz = int(round(smooth_wz))
+        raw_gx = int(round(smooth_gx))
+        raw_gy = int(round(smooth_gy))
+        raw_gz = 0  # CONSTANT 0: Never move into depth / back direction!
 
         raw_gx = max(-self.max_gx, min(self.max_gx, raw_gx))
         raw_gy = max(-self.max_gy, min(self.max_gy, raw_gy))
-        raw_gz = max(-self.max_gz, min(self.max_gz, raw_gz))
 
-        if abs(smooth_wx - self.current_gx) > 0.52:
+        # Minimal jitter deadband
+        if abs(smooth_gx - self.current_gx) > 0.48:
             self.current_gx = raw_gx
-        if abs(smooth_wy - self.current_gy) > 0.52:
+        if abs(smooth_gy - self.current_gy) > 0.48:
             self.current_gy = raw_gy
-        if abs(smooth_wz - self.current_gz) > 0.52:
-            self.current_gz = raw_gz
+        self.current_gz = 0
 
         current_grid_pos = (self.current_gx, self.current_gy, self.current_gz)
 
@@ -687,42 +798,40 @@ class GestureProcessor:
         direction_badge = ""
 
         # === STATE: PAINT ===
+        # Temporarily simplified direct drawing (Section 6):
+        # Pinch starts stroke -> fingertip -> screen-to-grid conversion -> Bresenham/DDA -> blocks
         if self.state == self.STATE_PAINT:
-            float_pos = (smooth_wx, smooth_wy, smooth_wz)
             if not self.is_painting:
                 # Enter paint stroke
                 self.is_painting = True
                 self.stroke_count += 1
-                self.stroke_builder.start(float_pos)
-                active_cursor_cell = self.stroke_builder.active_cell
-                self.current_stroke = list(self.stroke_builder.stroke_cells)
-                self.current_stroke_set = set(self.stroke_builder.stroke_set)
-                self.last_stroke_cell = self.stroke_builder.last_cell
+                self.current_stroke = [current_grid_pos]
+                self.current_stroke_set = {current_grid_pos}
+                self.last_stroke_cell = current_grid_pos
+                self.movement_str = "START"
             else:
-                # Intelligent Segment-Based Sticky-Axis Geometric Path Generation
-                active_cursor_cell = self.stroke_builder.add_point(float_pos)
-                self.current_stroke = list(self.stroke_builder.stroke_cells)
-                self.current_stroke_set = set(self.stroke_builder.stroke_set)
-                self.last_stroke_cell = self.stroke_builder.last_cell
+                # Track instantaneous movement direction for debug overlay
+                if self.last_stroke_cell is not None:
+                    dx = current_grid_pos[0] - self.last_stroke_cell[0]
+                    dy = current_grid_pos[1] - self.last_stroke_cell[1]
+                    if abs(dx) >= abs(dy) and abs(dx) > 0:
+                        self.movement_str = "RIGHT ->" if dx > 0 else "<- LEFT"
+                    elif abs(dy) > abs(dx):
+                        self.movement_str = "^ UP" if dy > 0 else "v DOWN"
 
-            # Magnetically lock the cursor position on the grid
-            current_grid_pos = active_cursor_cell
-            self.current_gx, self.current_gy, self.current_gz = active_cursor_cell
-
-            # Axis lock status indicator
-            if self.stroke_builder.locked_axis == 'H':
-                axis_str = f"LOCKED ROW Y={self.stroke_builder.locked_coord}"
-            elif self.stroke_builder.locked_axis == 'V':
-                axis_str = f"LOCKED COL X={self.stroke_builder.locked_coord}"
-            elif self.stroke_builder.locked_axis == 'CURVE':
-                axis_str = "FREEHAND CURVE"
-            else:
-                axis_str = "ALIGNING INTENT..."
+                # Direct deterministic Bresenham/DDA interpolation with zero gaps
+                if current_grid_pos != self.last_stroke_cell and self.last_stroke_cell is not None:
+                    seg = interpolate_3d_line(self.last_stroke_cell, current_grid_pos)
+                    for c in seg:
+                        if c not in self.current_stroke_set:
+                            self.current_stroke.append(c)
+                            self.current_stroke_set.add(c)
+                    self.last_stroke_cell = current_grid_pos
 
             mode_badge = "PAINTING"
-            action_badge = "DRAWING STROKE"
+            action_badge = f"MOVE: {self.movement_str}"
             sub_badge = f"STROKE {self.stroke_count:02d} ({len(self.current_stroke)} BLOCKS)"
-            direction_badge = axis_str
+            direction_badge = f"GRID ({current_grid_pos[0]}, {current_grid_pos[1]}, {current_grid_pos[2]})"
 
         # === STATE: ROTATE ===
         elif self.state == self.STATE_ROTATE:
@@ -834,6 +943,8 @@ class GestureProcessor:
             "sub_badge": sub_badge,
             "direction_badge": direction_badge,
             "grid_pos": current_grid_pos,
+            "screen_pos": (screen_x, screen_y),
+            "movement_str": self.movement_str,
             "rot_x": self.rot_x,
             "rot_y": self.rot_y,
             "rot_z": self.rot_z,
@@ -884,6 +995,8 @@ class GestureProcessor:
             "sub_badge": "IDLE",
             "direction_badge": "HAND NOT DETECTED",
             "grid_pos": (0, 0, 0),
+            "screen_pos": (0, 0),
+            "movement_str": "STATIONARY",
             "rot_x": self.rot_x,
             "rot_y": self.rot_y,
             "rot_z": self.rot_z,
