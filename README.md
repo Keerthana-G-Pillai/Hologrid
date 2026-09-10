@@ -1,6 +1,6 @@
-# HoloGrid 3D Studio — Tony Stark / Iron Man Holographic Builder
+# HoloGrid 3D Studio 
 
-An uncluttered, interactive 3D holographic voxel workshop inspired by Tony Stark's CAD interface, rendered entirely in Python using OpenCV and NumPy with MediaPipe hand tracking.
+An uncluttered, interactive 3D holographic voxel workshop rendered entirely in Python using OpenCV and NumPy with MediaPipe hand tracking.
 
 ---
 
